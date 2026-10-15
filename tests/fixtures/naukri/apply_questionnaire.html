@@ -1,0 +1,152 @@
+<!doctype html><html><body>
+<!-- Mirrors Naukri's real recruiter questionnaire (captured 2026-10-15 via `jobagent naukri inspect`):
+     a greeting first, each question "typed" (empty bubble, then text), checkbox questions as
+     input.mcc__checkbox + label.mcc__label, and Save as div.sendMsg inside div.sendMsgbtn_container. -->
+<style>
+  /* like Naukri: the real inputs are hidden; the label is what people click */
+  .mcc__checkbox, .ssrc__radio { display: none; }
+  .mcc__label { display: inline-block; padding: 4px 8px; border: 1px solid #999; cursor: pointer; }
+  /* like Naukri: Save is greyed out and unclickable until the current question has an answer */
+  .send.disabled .sendMsg { pointer-events: none; opacity: 0.5; }
+</style>
+<h1>Backend Developer</h1>
+<button id="apply-button">Apply</button>
+<div class="chatbot_Drawer chatbot_right" id="outer" style="display:none">
+  <div class="chatbot_DrawerContentWrapper" id="drawer">
+    <div class="chatbot_MessageContainer"><ul class="list" id="msgs"></ul></div>
+    <div id="inputArea"></div>
+    <div class="chatbot_InputContainer"><div class="textAreaWrapper">
+      <div class="textArea" id="textArea" contenteditable="true" style="display:none"></div>
+    </div></div>
+    <div class="sendMsgbtn_container"><div class="send disabled"><div class="sendMsg" id="send" tabindex="0">Save</div></div></div>
+  </div>
+</div>
+<div id="success" style="display:none"><span>Applied to "Backend Developer"</span></div>
+<script>
+  const sets = {
+    default: [
+      {q: "What is your current CTC (in lakhs)?", type: "text"},
+      {q: "Are you willing to relocate to Bengaluru?", type: "radio", options: ["Yes", "No"]},
+    ],
+    // as seen live: ticking a box can send the answer by itself, then the next question arrives
+    graduation: [
+      {q: "Year of Graduation/Post Graduation", type: "checkbox", options: ["2024", "2025", "2026"], autoSend: true},
+      {q: "Current Location (City)", type: "text"},
+      {q: "Full-Time Experience (If Any)", type: "text", skippable: true},
+      {q: "Please upload your resume.", type: "upload"},
+    ],
+    // Naukri's profile-update bot (live 2026-10-15): intro lines, chip question, then a searchable chip list
+    profile: [
+      {q: "What is the name of your undergraduate course?", type: "chips", options: ["B.Tech / B.E.", "B.Com", "B.Sc"]},
+      {q: "Awesome! What specialization did you choose in B.Tech / B.E.?", type: "chips", search: true,
+       options: ["Agricultural Engineering", "Apparel Technology", "Mechanical Engineering", "Computer Science"], shown: 2},
+      {q: "Please share your date of birth", type: "text"},
+    ],
+    passport: [{q: "Do you hold a valid passport?", type: "radio", options: ["Yes", "No"]}],
+    reject: [{q: "What is your current CTC (in lakhs)?", type: "text", neverAccept: true}],
+  };
+  const questions = sets[location.hash.slice(1) || "default"];
+  window.clicked = false; window.answers = [];
+  let i = -1;
+  const $ = id => document.getElementById(id);
+  function botSays(text, then) {
+    const li = document.createElement("li");
+    li.className = "botItem chatbot_ListItem";
+    // like Naukri: each bot message carries a logo in div.chipMsg (not an answer chip); typing bubble empty at first
+    li.innerHTML = '<div class="chipMsg" style="display:inline-block;width:24px;height:24px;background:#36f"></div>' +
+                   '<div class="botMsg msg"><div><span></span></div></div>';
+    $("msgs").appendChild(li);
+    setTimeout(() => { li.querySelector("span").textContent = text; if (then) then(); }, 250);
+  }
+  function render() {
+    const q = questions[i];
+    $("inputArea").innerHTML = "";
+    $("textArea").style.display = "none";
+    botSays(q.q, () => {
+      if (q.skippable) {  // real markup: the Skip button is a chip in a chips row
+        $("inputArea").innerHTML = '<div class="chatbot_Chips chatbot_ChipsInRow"><div class="chatbot_Chip chipInRow chipItem" id="skip"><span>Skip this question</span></div></div>';
+        $("skip").onclick = () => { window.answers.push("(skipped)"); advance(); };
+      }
+      if (q.type === "upload") {  // real markup: two chips + a hidden file input; uploading moves on by itself
+        $("inputArea").innerHTML = '<div class="chatbot_Chips chatbot_ChipsInRow"><div class="chatbot_Chip chipInRow chipItem"><span>Upload Resume</span></div>' +
+          '<div class="chatbot_Chip chipInRow chipItem" id="later"><span>I\'ll do it later</span></div></div>' +
+          '<form><input class="chatbot_Uploader" type="file" id="uploader" style="display:none"></form>';
+        $("later").onclick = () => { window.answers.push("(later)"); advance(); };
+        // as seen live: a file pushed into the input without clicking "Upload Resume" first is rejected
+        let armed = false;
+        $("inputArea").querySelector(".chatbot_Chip").onclick = () => { armed = true; $("uploader").click(); };
+        $("uploader").onchange = e => {
+          if (!armed) { botSays("File upload was unsuccessful. Please try again.", () => render()); return; }  // then re-asks
+          window.answers.push(e.target.files[0].name); advance();
+        };
+        return;
+      }
+      if (q.type === "chips") {
+        const show = list => {
+          $("inputArea").innerHTML = '<div class="chatbot_Chips">' +
+            list.map(o => `<div class="chatbot_Chip chipItem"><span>${o}</span></div>`).join("") + "</div>";
+          $("inputArea").querySelectorAll(".chatbot_Chip").forEach(c =>
+            c.onclick = () => { window.answers.push(c.innerText.trim()); advance(); });
+        };
+        show(q.options.slice(0, q.shown || q.options.length));  // like "Load more": only some on screen
+        if (q.search) {
+          $("textArea").style.display = "block";
+          $("textArea").onkeyup = () => {
+            const typed = $("textArea").innerText.trim().toLowerCase();
+            show(typed ? q.options.filter(o => o.toLowerCase().includes(typed)) : q.options.slice(0, q.shown));
+          };
+        }
+        return;
+      }
+      if (q.type === "text") { $("textArea").style.display = "block"; return; }
+      const type = q.type === "checkbox" ? "checkbox" : "radio";
+      const cls = type === "checkbox" ? "mcc__checkbox" : "ssrc__radio";
+      $("inputArea").innerHTML = q.options.map(o =>
+        `<input type="${type}" id="${o}" name="q${i}" value="${o}" class="${cls}"><label for="${o}" class="mcc__label">${o}</label><br>`
+      ).join("");
+      $("inputArea").querySelectorAll("input").forEach(input => input.addEventListener("change", () => {
+        enableSave(true);
+        if (q.autoSend) submit();  // immediately, as observed live: Save is greyed out again before anyone clicks it
+      }));
+    });
+  }
+  function enableSave(on) { document.querySelector(".send").classList.toggle("disabled", !on); }
+  // like Naukri: Save reacts to real keystrokes (keyup), so text set without typing leaves it disabled
+  document.addEventListener("keyup", e => { if (e.target.id === "textArea") enableSave(e.target.innerText.trim() !== ""); });
+  // like Naukri: the profile bot opens AFTER the application is accepted, and the button only turns
+  // into "Applied" when the page is reloaded
+  if (location.hash === "#profile" && localStorage.getItem("applied")) {
+    $("apply-button").outerHTML = '<button id="already-applied">Applied</button>';
+  }
+  $("apply-button") && ($("apply-button").onclick = () => {
+    if (location.hash === "#profile") localStorage.setItem("applied", "1");
+    window.clicked = true; $("outer").style.display = "block";
+    const start = () => setTimeout(() => { i = 0; render(); }, 250);
+    if (location.hash === "#profile")
+      botSays("Hi Sample! we request you to take a couple of minutes to update your profile.", () =>
+        botSays("This helps us to recommend better jobs for you and an updated profile receives higher recruiter actions.", start));
+    else
+      botSays("Hi Sample Candidate, thank you for showing interest. Kindly answer all the recruiter's questions to successfully apply for the job.", start);
+  });
+  $("send").onclick = () => submit();
+  function submit() {
+    const q = questions[i];
+    if (!q) return;
+    const value = q.type === "text"
+      ? $("textArea").innerText.trim()
+      : [...$("inputArea").querySelectorAll("input:checked")].map(e => e.value).join(",");
+    if (!value || q.neverAccept) return;
+    window.answers.push(value);
+    advance();
+  }
+  function advance() {
+    $("textArea").innerText = "";
+    i += 1;
+    enableSave(false);
+    if (i < questions.length) render();
+    else botSays("Thank you for your responses.", () => setTimeout(() => {  // as live: sign-off, then confirmation
+      $("outer").style.display = "none"; $("success").style.display = "block";
+    }, 600));
+  }
+</script>
+</body></html>

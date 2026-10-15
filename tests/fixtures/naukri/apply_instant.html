@@ -1,0 +1,13 @@
+<!doctype html><html><body>
+<h1>Backend Developer</h1>
+<button id="apply-button">Apply</button>
+<div id="success" style="display:none">You have successfully applied to Backend Developer</div>
+<script>
+  window.clicked = false;
+  document.getElementById("apply-button").onclick = () => {
+    window.clicked = true;
+    document.getElementById("apply-button").remove();
+    document.getElementById("success").style.display = "block";
+  };
+</script>
+</body></html>

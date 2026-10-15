@@ -1,0 +1,37 @@
+# Job-search preferences. Live applying needs `reviewed: false`, `mode.dry_run: false`, and
+# `jobagent check` all green. Pause everything any time with `mode.paused: true`.
+# Your years of experience come from answers.yaml (employment.total_experience_years).
+reviewed: false
+
+search:
+  roles: ["Software Engineer", "Backend Developer"]
+  cities: ["Bengaluru", "Pune"]
+  include_remote: true
+  hours_old: 24                # only jobs posted in the last N hours
+  results_per_query: 10        # per site, per role, per city (18 searches × 4 sites per run)
+  sites: [naukri, linkedin, indeed, glassdoor]
+
+blocklist:
+  companies: []               # add your current employer: never apply or email there
+
+matching:
+  min_score: 70                # apply only at or above this Claude match score (0-100)
+  min_skill_overlap: 2         # skip without calling Claude if fewer of your skills appear in the posting
+  experience_tolerance_years: 1
+
+caps:                          # start low; raise after a week of clean runs
+  naukri_applies_per_day: 2
+  ats_applies_per_day: 5
+  emails_per_day: 5
+  usd_per_day: 4.0             # stop calling Claude for the day after this estimated spend
+
+outreach:
+  enabled: false              # emails are drafted for you to review in the dashboard; true = the outbox sends them
+  send_hours: [10, 18]         # IST, Monday-Friday; at most one email per 15 minutes
+  follow_up_after_days: 6      # business days; one short follow-up, then stop
+  company_cooldown_days: 30    # never email the same company twice within this window
+  find_website: true           # look up company websites (Claude web search) to find HR/careers addresses
+
+mode:
+  dry_run: true                # do everything except the final submit/send
+  paused: false                # kill switch

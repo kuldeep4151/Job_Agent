@@ -1,0 +1,56 @@
+# Your facts for application forms. The agent copies these into forms; Claude never makes them up.
+# Replace every TODO. `jobagent check` lists the ones left. Copy to answers.yaml (git-ignored).
+
+personal:
+  full_name: TODO
+  email: TODO
+  phone: TODO                       # e.g. "+91 98xxxxxxxx"
+  current_city: TODO
+  linkedin_url: TODO
+  github_url: ""                    # optional
+  portfolio_url: ""                 # optional
+
+employment:
+  current_company: TODO             # also add it to config.yaml blocklist
+  current_designation: TODO
+  total_experience_years: TODO      # e.g. 4.5
+  relevant_experience_years: TODO
+  full_time_experience_years: ""   # optional; full-time only (no internships). Blank = questions about it get skipped or go to manual
+
+compensation:
+  current_ctc_lpa: TODO             # e.g. 12.5  (lakhs per annum)
+  expected_ctc_lpa: TODO
+
+notice:
+  notice_period_days: TODO          # e.g. 30, 60, 90
+  serving_notice: false
+  last_working_day: ""              # YYYY-MM-DD, only if serving notice
+  immediate_joiner: false
+
+preferences:
+  preferred_cities: [TODO]
+  willing_to_relocate: TODO         # true / false
+  ok_with_work_from_office: TODO    # true / false
+
+education:
+  tenth_percent: TODO
+  tenth_year: TODO
+  twelfth_percent: TODO
+  twelfth_year: TODO
+  degree: TODO                      # bachelor's, e.g. "B.Tech, Computer Science"
+  degree_institution: TODO
+  degree_specialization: TODO       # branch/major, e.g. "Computer Science"
+  degree_score: TODO                # e.g. "78%" or "8.1 CGPA"
+  degree_year: TODO
+  postgrad_degree: ""               # optional, e.g. "M.Tech, Computer Science"
+  postgrad_institution: ""
+  postgrad_specialization: ""
+  postgrad_score: ""
+  postgrad_year: ""
+
+# Optional: hands-on years per skill, for questionnaire items like "Experience in React Native (years)?".
+# Questions about skills NOT listed here go to the manual queue instead of being guessed. Example:
+#   skill_experience_years:
+#     Python: 1
+#     React Native: 0.75
+skill_experience_years: {}

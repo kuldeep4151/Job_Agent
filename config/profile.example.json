@@ -1,0 +1,64 @@
+{
+  "name": "Sample Candidate",
+  "email": "sample.candidate@example.com",
+  "phone": "+91 90000 00000",
+  "location": "Bengaluru, India",
+  "links": [
+    {"label": "LinkedIn", "url": "https://www.linkedin.com/in/sample-candidate"},
+    {"label": "GitHub", "url": "https://github.com/sample-candidate"}
+  ],
+  "headline": "Backend Software Engineer",
+  "summary": "Backend engineer with 4 years of experience building payment and order-management services in Python and Go. Comfortable owning services end to end, from API design to on-call.",
+  "skills": [
+    {"name": "Languages", "skills": ["Python", "Go", "SQL", "TypeScript"]},
+    {"name": "Backend", "skills": ["Django", "FastAPI", "gRPC", "REST APIs", "Celery"]},
+    {"name": "Data & Infra", "skills": ["PostgreSQL", "Redis", "Kafka", "Docker", "Kubernetes", "AWS"]}
+  ],
+  "experience": [
+    {
+      "company": "Example Payments Pvt Ltd",
+      "title": "Software Engineer II",
+      "location": "Bengaluru",
+      "start": "Jul 2023",
+      "end": "Present",
+      "bullets": [
+        "Built a refund-reconciliation service in Go processing 2M transactions/day, cutting manual finance escalations by 60%.",
+        "Moved settlement reports from nightly cron jobs to Kafka consumers, reducing report latency from 6 hours to 10 minutes.",
+        "Led migration of 14 Django endpoints to FastAPI with zero downtime, improving p95 latency by 35%.",
+        "Mentored 2 junior engineers and ran the team's weekly on-call review."
+      ]
+    },
+    {
+      "company": "Sample Retail Tech",
+      "title": "Software Engineer",
+      "location": "Pune",
+      "start": "Jun 2021",
+      "end": "Jun 2023",
+      "bullets": [
+        "Developed order-management APIs in Django and PostgreSQL serving 300+ partner stores.",
+        "Added Redis caching to the catalogue service, reducing database load by 40%.",
+        "Wrote Celery pipelines that sync inventory from 3 ERP systems every 15 minutes."
+      ]
+    }
+  ],
+  "projects": [
+    {
+      "name": "UPI Expense Tracker",
+      "link": "https://github.com/sample-candidate/upi-tracker",
+      "bullets": [
+        "Parses bank SMS exports to categorise UPI spends; 1,200+ GitHub stars."
+      ]
+    }
+  ],
+  "education": [
+    {
+      "institution": "Example Institute of Technology, Pune",
+      "degree": "B.Tech, Computer Science",
+      "start": "2017",
+      "end": "2021",
+      "score": "8.2 CGPA"
+    }
+  ],
+  "certifications": ["AWS Certified Developer – Associate (2024)"],
+  "achievements": ["Winner, internal hackathon 2024 (fraud-detection prototype)"]
+}

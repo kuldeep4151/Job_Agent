@@ -1,0 +1,7 @@
+# Companies whose own job boards are checked directly, on top of Naukri/LinkedIn/Indeed/Glassdoor.
+# Use the board name from the company's careers URL:
+#   job-boards.greenhouse.io/<name>  or  boards.greenhouse.io/<name>   → greenhouse
+#   jobs.lever.co/<name>                                               → lever
+# Only jobs located in India (or your cities) and matching your roles are kept.
+greenhouse: []
+lever: []

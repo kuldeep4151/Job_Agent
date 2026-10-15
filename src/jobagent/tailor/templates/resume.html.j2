@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ p.name }} – Resume</title>
+<style>
+  /* Single column, real text, standard headings: what ATS parsers read best. */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; font-size: 10pt; line-height: 1.38; color: #1a1a1a; }
+  header { margin-bottom: 9pt; }
+  h1 { font-size: 19pt; font-weight: 700; letter-spacing: 0.2pt; }
+  .headline { font-size: 11pt; color: #333; margin-top: 1pt; }
+  a { color: inherit; text-decoration: none; }
+  .contact { font-size: 9pt; color: #333; margin-top: 4pt; }
+  /* nowrap: a URL split at its hyphen extracts as a broken link in ATS parsers */
+  .contact span { white-space: nowrap; }
+  .contact span + span::before { content: " · "; color: #888; }
+  section { margin-top: 9pt; }
+  h2 { font-size: 9.5pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8pt;
+       border-bottom: 0.75pt solid #999; padding-bottom: 1.5pt; margin-bottom: 4pt; break-after: avoid; }
+  /* entries may split across pages between bullets, but a heading never ends a page */
+  .entry { margin-top: 5pt; }
+  .entry:first-of-type { margin-top: 0; }
+  .row { display: flex; justify-content: space-between; gap: 12pt; break-after: avoid; }
+  .what { font-weight: 700; }
+  .where { color: #333; }
+  .when { white-space: nowrap; color: #333; font-size: 9pt; }
+  ul { margin: 2pt 0 0 13pt; }
+  li { margin-top: 1.5pt; break-inside: avoid; }
+  /* a word wrapped at its hyphen extracts as "react-nativereanimated" in ATS parsers */
+  .nw { white-space: nowrap; }
+  .skills div { margin-top: 1.5pt; }
+  .skills b { font-weight: 700; }
+</style>
+</head>
+<body>
+<header>
+  <h1>{{ p.name }}</h1>
+  {% if p.headline %}<div class="headline">{{ p.headline }}</div>{% endif %}
+  <div class="contact">
+    {% if p.location %}<span>{{ p.location }}</span>{% endif %}
+    {% if p.phone %}<span>{{ p.phone }}</span>{% endif %}
+    {% if p.email %}<span><a href="mailto:{{ p.email }}">{{ p.email }}</a></span>{% endif %}
+    {% for link in p.links %}<span><a href="{{ link.url }}">{{ link.url | display_url }}</a></span>{% endfor %}
+  </div>
+</header>
+
+{% if p.summary %}
+<section>
+  <h2>Summary</h2>
+  <p>{{ p.summary | nobreak }}</p>
+</section>
+{% endif %}
+
+{% if p.skills %}
+<section class="skills">
+  <h2>Skills</h2>
+  {% for group in p.skills if group.skills %}
+  <div>{% if group.name %}<b>{{ group.name }}:</b> {% endif %}{{ group.skills | join(", ") | nobreak }}</div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if p.experience %}
+<section>
+  <h2>Experience</h2>
+  {% for role in p.experience %}
+  <div class="entry">
+    <div class="row">
+      <div><span class="what">{{ role.title }}</span>{% if role.company %}<span class="where">, {{ role.company }}</span>{% endif %}{% if role.location %}<span class="where"> · {{ role.location }}</span>{% endif %}</div>
+      <div class="when">{{ role.start }}{% if role.end %} – {{ role.end }}{% endif %}</div>
+    </div>
+    {% if role.bullets %}
+    <ul>{% for b in role.bullets %}<li>{{ b | nobreak }}</li>{% endfor %}</ul>
+    {% endif %}
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if p.projects %}
+<section>
+  <h2>Projects</h2>
+  {% for project in p.projects %}
+  <div class="entry">
+    <div class="row">
+      <div class="what">{{ project.name }}</div>
+      {% if project.link %}<div class="when"><a href="{{ project.link }}">{{ project.link | display_url }}</a></div>{% endif %}
+    </div>
+    {% if project.bullets %}
+    <ul>{% for b in project.bullets %}<li>{{ b | nobreak }}</li>{% endfor %}</ul>
+    {% endif %}
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if p.education %}
+<section>
+  <h2>Education</h2>
+  {% for edu in p.education %}
+  <div class="entry">
+    <div class="row">
+      <div><span class="what">{{ edu.degree }}</span>{% if edu.institution %}<span class="where">, {{ edu.institution }}</span>{% endif %}{% if edu.score %}<span class="where"> · {{ edu.score }}</span>{% endif %}</div>
+      <div class="when">{{ edu.start }}{% if edu.start and edu.end %} – {% endif %}{{ edu.end }}</div>
+    </div>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if p.certifications %}
+<section>
+  <h2>Certifications</h2>
+  <ul>{% for c in p.certifications %}<li>{{ c | nobreak }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+
+{% if p.achievements %}
+<section>
+  <h2>Achievements</h2>
+  <ul>{% for a in p.achievements %}<li>{{ a | nobreak }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+</body>
+</html>
