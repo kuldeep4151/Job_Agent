@@ -102,6 +102,16 @@ def format_value(key: str, value: object, unit: str) -> str:
     return str(value)
 
 
+_UNIT_WORDS = {"lakhs": "LPA", "days": "days", "weeks": "weeks", "months": "months", "years": "years"}
+
+
+def _with_unit(key: str, value: str, unit: str) -> str:
+    word = _UNIT_WORDS.get(unit if unit != "as_is" else (_base_unit(key) or ""))
+    if not word or not re.fullmatch(r"-?\d+(\.\d+)?", value):
+        return value
+    return f"{value} {word[:-1] if value == '1' and word != 'LPA' else word}"  # "1 month", "2 months"
+
+
 def _pick_option(value: str, options: list[str], suggested: str) -> str:
     """Yes/No and exact-text options are chosen by code; otherwise Claude's pick must be a listed option."""
     normalised = {o.strip().lower(): o for o in options if o.strip()}  # a blank option is never an answer
@@ -166,7 +176,8 @@ class AnswerMapper:
         return llm.parse(self.Mapping, task="form_map", system=self.system, content=content,
                          effort="low", max_tokens=2000)
 
-    def answer(self, question: Question, job: Job) -> Answer:
+    def answer(self, question: Question, job: Job, *, units_in_text: bool = False) -> Answer:
+        """units_in_text: free-text boxes without validation (Greenhouse/Lever) get "10 LPA", not a bare "10"."""
         mapping = self._ask(question, job)
         if mapping.key == UNKNOWN:
             raise Unanswerable(f"no fact answers {question.text!r}")
@@ -178,6 +189,8 @@ class AnswerMapper:
             return Answer(value=text, source=FREE_TEXT)
 
         value = format_value(mapping.key, self.facts[mapping.key], mapping.unit)
+        if units_in_text and question.kind == "text":
+            value = _with_unit(mapping.key, value, mapping.unit)
         if question.kind in ("choice", "multi"):
             try:
                 value = _pick_option(value, question.options, mapping.option)
@@ -190,3 +203,29 @@ class AnswerMapper:
 
 def clean_question(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+# For filling forms by hand ("Needs you" queue): the usual Indian application-form fields, labelled.
+_FORM_LABELS = [
+    ("personal.full_name", "Full name"), ("personal.email", "Email"), ("personal.phone", "Phone"),
+    ("personal.current_city", "Current city"), ("personal.linkedin_url", "LinkedIn"),
+    ("personal.github_url", "GitHub"), ("personal.portfolio_url", "Portfolio"),
+    ("employment.current_company", "Current company"), ("employment.current_designation", "Current designation"),
+    ("employment.total_experience_years", "Total experience (years)"),
+    ("employment.full_time_experience_years", "Full-time experience (years)"),
+    ("employment.relevant_experience_years", "Relevant experience (years)"),
+    ("compensation.current_ctc_lpa", "Current CTC (LPA)"), ("compensation.expected_ctc_lpa", "Expected CTC (LPA)"),
+    ("notice.notice_period_days", "Notice period (days)"), ("notice.immediate_joiner", "Immediate joiner"),
+    ("preferences.preferred_cities", "Preferred cities"), ("preferences.willing_to_relocate", "Willing to relocate"),
+    ("education.degree", "Bachelor's degree"), ("education.degree_specialization", "Specialization"),
+    ("education.degree_institution", "College"), ("education.degree_score", "Score"),
+    ("education.degree_year", "Graduation year"), ("education.postgrad_degree", "Master's degree"),
+    ("education.postgrad_institution", "University"), ("education.postgrad_score", "GPA"),
+    ("education.postgrad_year", "Post-graduation year"),
+]
+
+
+def copy_ready_answers(answers: dict) -> list[tuple[str, str]]:
+    """(label, value) pairs for the facts that are filled in, formatted as forms expect them."""
+    facts = flatten(answers)
+    return [(label, format_value(key, facts[key], "as_is")) for key, label in _FORM_LABELS if key in facts]

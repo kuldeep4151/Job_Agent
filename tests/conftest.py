@@ -8,8 +8,8 @@ import anthropic
 import httpx2
 import pytest
 
-from jobagent import llm, settings, setup_status
-from jobagent.apply import browser, naukri
+from jobagent import health, llm, settings, setup_status
+from jobagent.apply import browser, evidence, naukri, router
 from jobagent.outreach import contacts, gmail
 
 SAMPLE_PROFILE = settings.CONFIG_DIR / "profile.example.json"
@@ -77,9 +77,13 @@ def isolate_from_real_setup(monkeypatch, tmp_path):
     monkeypatch.setattr(gmail, "send", refuse("send a real email"))
     monkeypatch.setattr(gmail, "Mailbox", refuse("open the real Gmail inbox"))
     monkeypatch.setattr(contacts, "has_mx", lambda domain: True)  # no DNS lookups in tests
+    monkeypatch.setattr(router, "resolve", lambda url, client: url)  # never follow real short links
+    monkeypatch.setattr(health, "online", lambda timeout=6.0: True)  # never depend on the real network
+    monkeypatch.delenv("GMAIL_ADDRESS", raising=False)  # .env has the real Gmail: tests opt in with fake ones
+    monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
     monkeypatch.setattr(setup_status, "ready_for_live", lambda: False)
     monkeypatch.setattr(settings, "RESUME_DIR", tmp_path / "resumes")
-    monkeypatch.setattr(naukri, "SHOTS_DIR", tmp_path / "shots")
+    monkeypatch.setattr(evidence, "SHOTS_DIR", tmp_path / "shots")
 
 
 @pytest.fixture

@@ -29,6 +29,7 @@ class Caps(BaseModel):
     ats_applies_per_day: int = 5
     emails_per_day: int = 5
     usd_per_day: float = 4.0
+    usd_per_month: float = 60.0
 
 
 class Outreach(BaseModel):

@@ -6,17 +6,20 @@ finished by the next one, and nothing is scored twice.
 
 import random
 import time
+import traceback
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
 
 import anthropic
+import httpx
 from playwright.sync_api import Error as PlaywrightError
 from sqlalchemy import func
 from sqlmodel import Session, select
 
-from jobagent import db, guards, llm, settings
-from jobagent.apply import browser, naukri
+from jobagent import alerts, db, guards, health, llm, settings
+from jobagent.apply import browser, evidence, greenhouse, lever, naukri, router
 from jobagent.apply.answers import AnswerMapper
 from jobagent.config import load_answers, load_config, load_targets
 from jobagent.discover import ats_boards, jobspy_src
@@ -49,6 +52,7 @@ class Tally:
     tailored: int = 0
     applied: int = 0
     drafted: int = 0
+    needs_you: int = 0
     notes: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -167,14 +171,38 @@ def tailor_scored(session: Session, ctx: MatchContext, tally: Tally) -> None:
         session.commit()
 
 
+def route_tailored(session: Session, tally: Tally) -> None:
+    """Tag each tailored job with where it's applied to; anything not automatable goes to "Needs you"."""
+    pending = session.exec(select(Job).where(Job.state == State.TAILORED, Job.ats.is_(None))).all()
+    if not pending:
+        return
+    with httpx.Client(timeout=15, headers={"User-Agent": "Mozilla/5.0 (personal job search)"}) as client:
+        for job in pending:
+            job.ats, job.apply_target = router.route(job, client)
+            if job.ats not in router.AUTO_ATS:
+                job.state, job.apply_note = State.MANUAL, router.how_to_apply(job.ats)
+                tally.needs_you += 1
+            session.commit()
+
+
 PAUSE_SECONDS = (20.0, 60.0)  # between Naukri applications: human pace, fewer bot flags
 
 
-def _record_outcome(job: Job, outcome: naukri.Outcome) -> None:
+def _open_browser(stack: ExitStack, tally: Tally):
+    """The agent's Chrome, or None (noted) when it can't start: seen live during a macOS dark wake,
+    when there's no screen for its window."""
+    try:
+        return stack.enter_context(browser.naukri_context())
+    except PlaywrightError as e:
+        tally.note(f"Applying skipped: couldn't start Chrome (Mac asleep or screen locked?): {str(e)[:120]}")
+        return None
+
+
+def _record_outcome(job: Job, outcome: evidence.Outcome) -> None:
     job.apply_note = outcome.note
     if outcome.screenshot:
         job.apply_screenshot = settings.stored_path(outcome.screenshot)
-    job.apply_qa = naukri.qa_json(outcome) or job.apply_qa
+    job.apply_qa = evidence.qa_json(outcome) or job.apply_qa
     if outcome.status == "applied":
         job.state, job.applied_at = State.APPLIED, utcnow()
     elif outcome.status == "dry_run":
@@ -215,7 +243,9 @@ def apply_naukri(
         tally.note(f"Naukri: {why}; nothing was submitted.")
 
     mapper = AnswerMapper(ctx.answers, ctx.profile)
-    with browser.naukri_context() as context:
+    with ExitStack() as stack:
+        if (context := _open_browser(stack, tally)) is None:
+            return
         page = browser.first_page(context)
         if not naukri.is_logged_in(page):
             tally.note("Naukri is logged out: run `jobagent naukri login`. Nothing was applied.")
@@ -228,9 +258,9 @@ def apply_naukri(
             try:
                 outcome = naukri.apply_to_job(page, job, mapper, live=live)
             except PlaywrightError as e:
-                outcome = naukri.Outcome("failed", f"browser error: {e}"[:300])
+                outcome = evidence.Outcome("failed", f"browser error: {e}"[:300])
                 try:
-                    outcome.screenshot = naukri.save_evidence(page, job.id, "error", html=True)
+                    outcome.screenshot = evidence.save_evidence(page, job.id, "error", html=True)
                 except PlaywrightError:
                     pass  # the page itself is gone; the note still says what happened
             _record_outcome(job, outcome)
@@ -288,8 +318,8 @@ def draft_outreach(session: Session, ctx: MatchContext, tally: Tally, *, job_id:
         else:
             try:
                 contact, job.outreach_note = contacts.best_contact(job, allow_lookup=config.outreach.find_website)
-            except llm.LLMError as e:
-                contact, job.outreach_note = None, f"website lookup failed: {e}"
+            except (llm.LLMError, anthropic.APIError, httpx.HTTPError) as e:
+                contact, job.outreach_note = None, f"website lookup failed: {e}"[:300]
             if contact is not None and (why := outbox.is_suppressed(session, contact.address)):
                 contact, job.outreach_note = None, f"{contact.address} is suppressed ({why})"
             if contact is not None:
@@ -299,8 +329,8 @@ def draft_outreach(session: Session, ctx: MatchContext, tally: Tally, *, job_id:
                         source=contact.source, company_key=company_key,
                         attachment=settings.stored_path(tailor.resume_for_job(job, ctx.profile)),
                     )
-                except llm.LLMError as e:
-                    job.outreach_note += f"; drafting failed: {e}"
+                except (llm.LLMError, anthropic.APIError) as e:
+                    job.outreach_note += f"; drafting failed: {e}"[:300]
                 else:
                     session.add(email)
                     drafted.append(email)
@@ -308,6 +338,51 @@ def draft_outreach(session: Session, ctx: MatchContext, tally: Tally, *, job_id:
         session.commit()
     tally.drafted += len(drafted)
     return drafted
+
+
+def apply_ats(session: Session, ctx: MatchContext, tally: Tally, *, job_id: int | None = None,
+              log: Callable[[str], None] = print) -> None:
+    """Greenhouse/Lever forms for tailored matches, within caps.ats_applies_per_day (dry run unless live)."""
+    mode, why = guards.apply_mode(ctx.config)
+    if mode == "off" or ctx.profile is None:
+        return
+    live = mode == "live"
+    if job_id is not None:
+        query = select(Job).where(Job.id == job_id, Job.ats.in_(list(router.AUTO_ATS)))
+    else:
+        query = select(Job).where(Job.state == State.TAILORED, Job.ats.in_(list(router.AUTO_ATS)))
+        query = query.where(Job.applied_at.is_(None) if live else Job.dry_run_at.is_(None))
+    remaining = ctx.config.caps.ats_applies_per_day - guards.ats_attempts_today(session, live)
+    jobs = session.exec(query.order_by(Job.score.desc()).limit(max(remaining, 0))).all()
+    if remaining <= 0 or not jobs:
+        return
+    if not live:
+        tally.note(f"Greenhouse/Lever: {why}; nothing was submitted.")
+
+    mapper = AnswerMapper(ctx.answers, ctx.profile)
+    with ExitStack() as stack:
+        client = stack.enter_context(httpx.Client(timeout=20))
+        if (context := _open_browser(stack, tally)) is None:
+            return
+        page = browser.first_page(context)
+        for i, job in enumerate(jobs):
+            if i:
+                time.sleep(random.uniform(*PAUSE_SECONDS))
+            resume = tailor.resume_for_job(job, ctx.profile)
+            log(f"{job.ats.title()} {'apply' if live else 'dry run'}: {job.title} at {job.company}")
+            try:
+                if job.ats == "greenhouse":
+                    outcome = greenhouse.apply(page, job, mapper, ctx.answers, resume, live=live, client=client,
+                                               security_code=greenhouse.code_from_gmail)
+                else:
+                    outcome = lever.apply(page, job, mapper, ctx.answers, resume, live=live)
+            except PlaywrightError as e:
+                outcome = evidence.Outcome("failed", f"browser error: {e}"[:300])
+            _record_outcome(job, outcome)
+            if outcome.status == "manual" and not job.apply_note.startswith(job.ats.title()):
+                job.apply_note = f"{job.ats.title()}: {job.apply_note}"
+            session.commit()
+            tally.applied += outcome.status == "applied"
 
 
 def _real_profile() -> Profile | None:
@@ -318,7 +393,7 @@ def _real_profile() -> Profile | None:
 
 
 def apply_only(*, job_id: int | None = None, live: bool = False, log: Callable[[str], None] = print) -> Tally:
-    """Just the Naukri apply stage (no discovery/scoring): `jobagent apply`.
+    """Just the apply stages, Naukri then Greenhouse/Lever (no discovery/scoring): `jobagent apply`.
 
     live=True submits for real even though config.yaml says dry_run, for one job only, so the user can
     watch a first application. Pause and the setup checks still apply.
@@ -333,7 +408,19 @@ def apply_only(*, job_id: int | None = None, live: bool = False, log: Callable[[
     tally = Tally()
     with db.session() as session:
         apply_naukri(session, ctx, tally, job_id=job_id, log=log)
+        apply_ats(session, ctx, tally, job_id=job_id, log=log)  # Greenhouse/Lever
     return tally
+
+
+def _step(name: str, session: Session, tally: Tally, action: Callable[[], object], log: Callable[[str], None]) -> None:
+    """Run one stage; an error is recorded and the next stages still run (seen live: a lost connection
+    in one stage used to crash the whole run, leaving no record of it)."""
+    try:
+        action()
+    except Exception as e:  # noqa: BLE001: any stage failure is recorded, never fatal to the run
+        session.rollback()
+        tally.errors.append(f"step {name} failed: {type(e).__name__}: {e}"[:400])
+        log(f"step {name} failed:\n{traceback.format_exc()}")
 
 
 def run(*, smoke: bool = False, log: Callable[[str], None] = print) -> Run | None:
@@ -343,6 +430,14 @@ def run(*, smoke: bool = False, log: Callable[[str], None] = print) -> Run | Non
         return None
 
     started, spent_before = utcnow(), guards.spent_today_usd()
+    if not health.online():
+        log(health.OFFLINE_NOTE)
+        with db.session() as session:
+            record = Run(started_at=started, finished_at=utcnow(), notes=[health.OFFLINE_NOTE])
+            session.add(record)
+            session.commit()
+        return record
+
     batch = Batch()
     searches = len(jobspy_src.queries(config.search, smoke))
     log(f"Searching {', '.join(config.search.sites)}: {searches} searches each…")
@@ -357,11 +452,17 @@ def run(*, smoke: bool = False, log: Callable[[str], None] = print) -> Run | Non
     with db.session() as session:
         new, duplicates = store(session, batch.jobs)
         log(f"Found {len(batch.jobs)} ({new} new, {duplicates} duplicates). Filtering and scoring…")
-        filter_discovered(session, ctx, tally)
-        score_filtered(session, ctx, tally)
-        tailor_scored(session, ctx, tally)
-        apply_naukri(session, ctx, tally, log=log)
-        draft_outreach(session, ctx, tally, log=log)
+        steps = [
+            ("filter", lambda: filter_discovered(session, ctx, tally)),
+            ("score", lambda: score_filtered(session, ctx, tally)),
+            ("tailor", lambda: tailor_scored(session, ctx, tally)),
+            ("route", lambda: route_tailored(session, tally)),
+            ("naukri", lambda: apply_naukri(session, ctx, tally, log=log)),
+            ("greenhouse/lever", lambda: apply_ats(session, ctx, tally, log=log)),
+            ("outreach", lambda: draft_outreach(session, ctx, tally, log=log)),
+        ]
+        for name, action in steps:
+            _step(name, session, tally, action, log)
         record = Run(
             started_at=started,
             finished_at=utcnow(),
@@ -381,4 +482,5 @@ def run(*, smoke: bool = False, log: Callable[[str], None] = print) -> Run | Non
         )
         session.add(record)
         session.commit()
+        alerts.from_run(session, record)
     return record

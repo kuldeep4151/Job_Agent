@@ -54,3 +54,8 @@ education:
 #     Python: 1
 #     React Native: 0.75
 skill_experience_years: {}
+
+# Optional: yes/no questions many forms make required. Blank = such forms go to "Needs you".
+other:
+  relatives_at_hiring_company: ""   # true/false: "Do you have relatives working at <company>?"
+  holds_other_offers: ""            # true/false: "Do you hold any other offers?"

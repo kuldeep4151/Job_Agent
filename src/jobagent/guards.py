@@ -40,19 +40,34 @@ def naukri_attempts_today(session: Session, live: bool) -> int:
     return session.exec(query).one()
 
 
-def spent_today_usd(log_path: Path | None = None) -> float:
-    """Estimated Claude spend since midnight IST, from the usage log."""
+def _spent_since(start, log_path: Path | None = None) -> float:
     path = log_path or llm.USAGE_LOG
     if not path.exists():
         return 0.0
-    today = datetime.now(IST).date()
     total = 0.0
     for line in path.read_text().splitlines():
         record = json.loads(line)
-        if datetime.fromisoformat(record["ts"]).astimezone(IST).date() == today:
+        if datetime.fromisoformat(record["ts"]).astimezone(IST).date() >= start:
             total += record["cost_usd"]
     return total
 
 
+def spent_today_usd(log_path: Path | None = None) -> float:
+    """Estimated Claude spend since midnight IST, from the usage log."""
+    return _spent_since(datetime.now(IST).date(), log_path)
+
+
+def spent_this_month_usd(log_path: Path | None = None) -> float:
+    return _spent_since(datetime.now(IST).date().replace(day=1), log_path)
+
+
 def budget_left_usd(config: Config) -> float:
-    return config.caps.usd_per_day - spent_today_usd()
+    """What may still be spent now: the tighter of today's and this month's caps."""
+    return min(config.caps.usd_per_day - spent_today_usd(), config.caps.usd_per_month - spent_this_month_usd())
+
+
+def ats_attempts_today(session: Session, live: bool) -> int:
+    """Greenhouse/Lever applications (or dry runs) today: their own cap, separate from Naukri's."""
+    column = Job.applied_at if live else Job.dry_run_at
+    query = select(func.count()).select_from(Job).where(Job.ats.in_(["greenhouse", "lever"]), column >= _start_of_today_utc())
+    return session.exec(query).one()

@@ -109,7 +109,7 @@ def test_missing_description_is_skipped_honestly_then_recovered(world, monkeypat
     pipeline.run(log=lambda _: None)
     orbit = jobs_by_company()["Orbit"]
     assert orbit.score == 84 and orbit.url.startswith("https://linkedin")
-    assert orbit.state == State.TAILORED  # a LinkedIn match gets its own resume
+    assert orbit.state == State.MANUAL and orbit.resume_path  # its own resume, then "Needs you"
     assert len(api.sent) == 2  # score + tailor
 
 
@@ -182,7 +182,8 @@ def test_run_tailors_matches_that_need_a_pdf(tailoring_world):
     assert record.matches == 2 and record.tailored == 1
     assert jobs["Acme"].state == State.SCORED and jobs["Acme"].resume_path is None  # Naukri profile apply
     nimbus = jobs["Nimbus"]
-    assert nimbus.state == State.TAILORED
+    assert nimbus.state == State.MANUAL  # tailored, then routed: not a Greenhouse/Lever form → "Needs you"
+    assert nimbus.ats == "company site" and nimbus.apply_note.startswith("Company careers site")
     assert nimbus.tailored_summary.startswith("Backend engineer with 4 years")
     assert nimbus.tailor_rationale.startswith("Kafka and Python first")
     pdf = Path(nimbus.resume_path)
@@ -194,7 +195,7 @@ def test_tailoring_failure_falls_back_to_original_resume(tailoring_world):
     api.reply_when("You tailor", '{"summary": "Backend', stop_reason="max_tokens")
     record = pipeline.run(log=lambda _: None)
     nimbus = jobs_by_company()["Nimbus"]
-    assert nimbus.state == State.TAILORED and nimbus.tailored_summary is None
+    assert nimbus.state == State.MANUAL and nimbus.tailored_summary is None
     assert "tailoring failed" in nimbus.tailor_notes and "using your original resume" in nimbus.tailor_notes
     assert Path(nimbus.resume_path).exists()
     assert any("max_tokens" in e for e in record.errors)
@@ -388,6 +389,126 @@ def test_dashboard_outreach_and_cancel(outreach_world):
         assert session.exec(select(pipeline.Email)).one().status == "cancelled"
 
 
+def test_needs_you_panel_and_mark_applied(tailoring_world, monkeypatch):
+    monkeypatch.setattr(pipeline.settings, "ANSWERS_PATH", pipeline.settings.CONFIG_DIR / "answers.example.yaml")
+    pipeline.run(log=lambda _: None)
+    nimbus = jobs_by_company()["Nimbus"]
+    assert nimbus.state == State.MANUAL
+    app = open_dashboard(nimbus.id)
+    assert not app.exception, app.exception
+    assert app.info[0].value.startswith("Company careers site")
+    assert any("Backend engineer with 4 years" in c.value for c in app.code)  # tailored "About me"
+    next(b for b in app.button if b.label == "Mark applied").click().run()
+    assert not app.exception, app.exception
+    done = jobs_by_company()["Nimbus"]
+    assert done.state == State.APPLIED and done.applied_at is not None
+
+
+@pytest.fixture
+def ats_world(world, monkeypatch):
+    """A Greenhouse job and a Lever job (by their company links); the form fillers themselves are mocked."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    config, api = world
+    rows = [row("50", "linkedin", "Backend Engineer", "Acme", GOOD_JD),
+            row("51", "indeed", "Backend Developer", "Orbit", GOOD_JD)]
+    rows[0]["job_url_direct"] = "https://job-boards.greenhouse.io/acme/jobs/1"
+    rows[1]["job_url_direct"] = "https://jobs.lever.co/orbit/2"
+    monkeypatch.setattr(jobspy_src, "discover", lambda search, batch, smoke=False: batch.jobs.extend(
+        jobspy_src.from_jobspy(r, query_city="Bengaluru") for r in rows))
+    api.reply_when("You screen", api.body["content"][0]["text"])
+    api.reply_when("You tailor", TAILOR_PLAN)
+    calls: list[str] = []
+    monkeypatch.setattr(pipeline.greenhouse, "apply", lambda page, job, *a, **k: calls.append(job.company)
+                        or pipeline.evidence.Outcome("dry_run", "dry run: Greenhouse form filled, not submitted"))
+    monkeypatch.setattr(pipeline.lever, "apply", lambda page, job, *a, **k: calls.append(job.company)
+                        or pipeline.evidence.Outcome("manual", "Lever form: required question 'Years of Go?'"))
+    monkeypatch.setattr(pipeline.browser, "naukri_context", contextmanager(lambda: iter([SimpleNamespace(pages=[None])])))
+    monkeypatch.setattr(pipeline, "PAUSE_SECONDS", (0, 0))  # no human-pace waits between jobs in tests
+    return config, calls
+
+
+def test_greenhouse_and_lever_go_through_the_ats_stage(ats_world):
+    config, calls = ats_world
+    pipeline.run(log=lambda _: None)
+    jobs = jobs_by_company()
+    acme, orbit = jobs["Acme"], jobs["Orbit"]
+    assert (acme.ats, acme.state) == ("greenhouse", State.TAILORED) and acme.dry_run_at is not None
+    assert (orbit.ats, orbit.state) == ("lever", State.MANUAL) and orbit.apply_note.startswith("Lever form:")
+    assert sorted(calls) == ["Acme", "Orbit"]
+
+    pipeline.run(log=lambda _: None)
+    assert sorted(calls) == ["Acme", "Orbit"]  # never re-attempted
+
+
+def test_ats_daily_cap(ats_world):
+    config, calls = ats_world
+    config.caps.ats_applies_per_day = 1
+    pipeline.run(log=lambda _: None)
+    assert len(calls) == 1
+
+
+def test_offline_run_is_recorded_and_skipped(world, monkeypatch):
+    calls = []
+    monkeypatch.setattr(pipeline.health, "online", lambda timeout=6.0: False)
+    monkeypatch.setattr(jobspy_src, "discover", lambda *a, **k: calls.append("discover"))
+    record = pipeline.run(log=lambda _: None)
+    assert record.notes == [pipeline.health.OFFLINE_NOTE] and calls == []
+
+
+def test_a_failing_step_is_recorded_and_the_rest_still_run(world, monkeypatch):
+    monkeypatch.setenv("GMAIL_ADDRESS", "me@gmail.com")
+    monkeypatch.setenv("GMAIL_APP_PASSWORD", "abcdefghijklmnop")
+    sent, later = [], []
+    monkeypatch.setattr(pipeline.alerts.gmail, "send", sent.append)
+
+    def boom(*_args, **_kwargs):
+        raise ConnectionError("network dropped mid-run")
+
+    monkeypatch.setattr(pipeline, "score_filtered", boom)
+    monkeypatch.setattr(pipeline, "draft_outreach", lambda *a, **k: later.append("outreach"))
+    record = pipeline.run(log=lambda _: None)
+
+    assert record.errors == ["step score failed: ConnectionError: network dropped mid-run"]
+    assert later == ["outreach"] and record.found == 5  # discovery and later steps still happened
+    assert len(sent) == 1 and "A run hit an error" in sent[0].get_content()
+
+
+def test_chrome_that_cannot_start_skips_applying(naukri_world, monkeypatch):
+    from playwright.sync_api import Error as PlaywrightError
+
+    config, use_pages, go_live, _ = naukri_world
+    use_pages("apply_instant")
+    go_live()
+
+    def no_window(*_args, **_kwargs):
+        raise PlaywrightError("BrowserType.launch_persistent_context: Timeout 60000ms exceeded.")
+
+    monkeypatch.setattr(pipeline.browser, "naukri_context", no_window)
+    record = pipeline.run(log=lambda _: None)
+    assert record.applied == 0 and not record.errors
+    assert any("couldn't start Chrome" in note for note in record.notes)
+
+
+def test_cli_records_a_crash(world, monkeypatch):
+    from jobagent import cli
+
+    def crash(**_kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(pipeline, "run", crash)
+    assert cli.cmd_run(type("Args", (), {"smoke": False})()) == 1
+    with db.session() as session:
+        assert session.exec(select(Run)).one().errors == ["crashed: RuntimeError: database is locked"]
+
+
+def test_digest_is_scheduled(world):
+    digest = schedule.agents()[schedule.DIGEST_LABEL]
+    assert digest["ProgramArguments"][-1] == "digest"
+    assert digest["StartCalendarInterval"] == {"Hour": 20, "Minute": 45}
+
+
 def open_dashboard(job_id: int | None = None):
     """Run the dashboard script headless. Streamlit's data cache is process-wide, so clear it per test."""
     import streamlit as st
@@ -406,7 +527,7 @@ def test_dashboard_shows_tailoring(tailoring_world):
     assert not app.exception, app.exception
     assert any("Tailored resume" in m.value for m in app.markdown)
     assert any("Backend engineer with 4 years" in m.value for m in app.markdown)
-    assert len(app.get("download_button")) == 2
+    assert len(app.get("download_button")) == 3  # "Needs you" resume + original/tailored in the details
 
 
 def test_dashboard_renders(world):

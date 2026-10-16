@@ -1,0 +1,35 @@
+<!doctype html><html><body>
+<!-- Mirrors a live Greenhouse form (job-boards.greenhouse.io, 2026-10-15): inputs carry the API field names
+     as ids; dropdowns are comboboxes whose options appear (role=option) as you type. -->
+<form id="application_form" onsubmit="event.preventDefault(); window.submitted = true; document.body.innerHTML = '<h1>Thank you for applying.</h1>';">
+  <label for="first_name">First Name*</label><input id="first_name" type="text">
+  <label for="last_name">Last Name*</label><input id="last_name" type="text">
+  <label for="email">Email*</label><input id="email" type="text">
+  <label for="country">Country*</label><input id="country" type="text" role="combobox">
+  <label for="phone">Phone*</label><input id="phone" type="tel">
+  <input id="resume" type="file">
+  <label for="question_1">Do you have relatives working at Acme?*</label><input id="question_1" type="text" role="combobox">
+  <label for="question_2">Current Compensation</label><input id="question_2" type="text">
+  <div id="listbox" role="listbox"></div>
+  <button type="submit">Submit application</button>
+</form>
+<script>
+  window.submitted = false; window.picked = {};
+  const options = {country: ["British Indian Ocean Territory +246", "India +91"], question_1: ["Yes", "No"]};
+  for (const id of Object.keys(options)) {
+    const box = document.getElementById(id);
+    const show = () => {
+      const typed = box.value.toLowerCase();
+      listbox.innerHTML = options[id].filter(o => o.toLowerCase().includes(typed))
+        .map(o => `<div role="option" data-for="${id}">${o}</div>`).join("");
+    };
+    box.addEventListener("click", show); box.addEventListener("input", show);
+  }
+  listbox.addEventListener("click", e => {
+    const o = e.target.closest("[role=option]");
+    if (!o) return;
+    window.picked[o.dataset.for] = o.innerText; document.getElementById(o.dataset.for).value = o.innerText;
+    listbox.innerHTML = "";
+  });
+</script>
+</body></html>

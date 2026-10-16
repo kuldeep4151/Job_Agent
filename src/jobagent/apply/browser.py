@@ -18,7 +18,8 @@ NAUKRI_PROFILE_DIR = settings.DATA_DIR / "browser" / "naukri"
 @contextmanager
 def naukri_context(headless: bool = False, profile_dir: Path = NAUKRI_PROFILE_DIR) -> Iterator[BrowserContext]:
     profile_dir.mkdir(parents=True, exist_ok=True)
-    options = {"headless": headless, "viewport": {"width": 1366, "height": 900}}
+    # 60s, not Playwright's 3 minutes: if Chrome can't open a window (Mac asleep), give up and retry next run
+    options = {"headless": headless, "viewport": {"width": 1366, "height": 900}, "timeout": 60_000}
     with sync_playwright() as pw:
         try:
             context = pw.chromium.launch_persistent_context(str(profile_dir), channel="chrome", **options)

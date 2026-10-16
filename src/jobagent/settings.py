@@ -44,3 +44,10 @@ def unfilled(data: Any, prefix: str = "") -> list[str]:
     if isinstance(data, list):
         return [prefix.rstrip(".")] if any(v == PLACEHOLDER for v in data) else []
     return [prefix.rstrip(".")] if data == PLACEHOLDER else []
+
+
+def rotate_logs(max_bytes: int = 5_000_000) -> None:
+    """Keep each data/logs/*.log under max_bytes: the full file moves to <name>.log.1 (one generation)."""
+    for log in LOG_DIR.glob("*.log"):
+        if log.stat().st_size > max_bytes:
+            log.replace(log.with_suffix(".log.1"))

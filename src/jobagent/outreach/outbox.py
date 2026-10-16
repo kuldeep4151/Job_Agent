@@ -5,6 +5,7 @@ inside send_hours (IST), and today's count under caps.emails_per_day. One email 
 """
 
 import fcntl
+import imaplib
 import re
 import smtplib
 from collections.abc import Callable
@@ -13,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
 from sqlmodel import Session, select
 
-from jobagent import settings
+from jobagent import health, settings
 from jobagent.config import Config
 from jobagent.discover.normalize import IST
 from jobagent.models import Email, EmailStatus, Suppression, utcnow
@@ -198,11 +199,18 @@ def tick(session: Session, config: Config, answers: dict, profile: Profile,
 
 
 def _tick(session: Session, config: Config, answers: dict, profile: Profile, log: Callable[[str], None]) -> None:
+    if not health.online():
+        log("outbox: offline (Mac asleep?), nothing done")
+        return
     if gmail.credentials() is not None and session.exec(select(Email).where(Email.status == EmailStatus.SENT)).first():
-        with gmail.Mailbox() as mailbox:
-            for event in check_inbox(session, mailbox):
-                log(f"outbox: {event}")
+        try:
+            with gmail.Mailbox() as mailbox:
+                for event in check_inbox(session, mailbox):
+                    log(f"outbox: {event}")
+        except (imaplib.IMAP4.error, OSError) as e:
+            log(f"outbox: couldn't read the inbox ({e}); will retry next tick")
     if queued := queue_follow_ups(session, config, answers, profile):
         log(f"outbox: queued {queued} follow-up(s)")
-    send_next(session, config, profile, log=log)
+    if send_next(session, config, profile, log=log) is None and sending_blocked(session, config) is None:
+        log("outbox: nothing to send")  # a line per tick, so outbox.log shows it's alive
 

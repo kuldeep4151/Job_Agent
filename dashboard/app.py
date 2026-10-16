@@ -8,9 +8,10 @@ import streamlit as st
 from sqlmodel import select
 
 from jobagent import db, guards, settings, setup_status
-from jobagent.config import load_config
+from jobagent.apply.answers import copy_ready_answers
+from jobagent.config import load_answers, load_config
 from jobagent.discover.normalize import IST
-from jobagent.models import Email, EmailStatus, Job, Run, State
+from jobagent.models import Email, EmailStatus, Job, Run, State, utcnow
 from jobagent.profile import load_profile
 
 st.set_page_config(page_title="Job Agent", page_icon="💼", layout="wide")
@@ -154,6 +155,46 @@ def _pdf_button(column, label: str, path, key: str) -> None:
         column.caption(f"{label}: file missing ({path.name})")
 
 
+def set_outcome(job_id: int, applied: bool) -> None:
+    with db.session() as session:
+        job = session.get(Job, job_id)
+        if applied:
+            job.state, job.applied_at, job.apply_note = State.APPLIED, utcnow(), "applied by you (marked in the dashboard)"
+        else:
+            job.state, job.skip_reason = State.SKIPPED, "not interested (dismissed in the dashboard)"
+        session.commit()
+    st.cache_data.clear()
+
+
+def show_needs_you(job: pd.Series) -> None:
+    """Everything to apply by hand in a couple of minutes: where, the resume, and copy-ready answers."""
+    job = job.astype(object).where(job.notna(), None)
+    st.divider()
+    st.subheader(f"{job['title']} · {job['company']}")
+    st.info(job["apply_note"] or "Open the link and apply.")
+    left, right = st.columns(2)
+    left.link_button("Open application page", job["apply_target"] or job["url"])
+    resume = settings.ROOT / job["resume_path"] if job["resume_path"] else settings.MASTER_RESUME_PDF
+    _pdf_button(right, "Download resume for this job", resume, f"needs-{job['id']}")
+
+    answers = copy_ready_answers(load_answers())
+    if answers:
+        st.markdown("**Your answers** (copy with the icon at the top right)")
+        st.code("\n".join(f"{label}: {value}" for label, value in answers), language=None)
+    about = job["tailored_summary"] or (load_profile(settings.PROFILE_PATH).summary if settings.PROFILE_PATH.exists() else "")
+    if about:
+        st.markdown("**About me** (for a summary / cover-note box)")
+        st.code(about, language=None, wrap_lines=True)
+
+    done, dismiss = st.columns(2)
+    if done.button("Mark applied", key=f"applied-{job['id']}", type="primary"):
+        set_outcome(int(job["id"]), applied=True)
+        st.rerun()
+    if dismiss.button("Not interested", key=f"dismiss-{job['id']}"):
+        set_outcome(int(job["id"]), applied=False)
+        st.rerun()
+
+
 def show_application(job: pd.Series) -> None:
     st.markdown("#### Application")
     when = f" on {_ist(job['applied_at'])}" if job["applied_at"] is not None else ""
@@ -214,10 +255,12 @@ if linked_id and not jobs.empty:
     if linked.empty:
         st.warning(f"No job with id {linked_id}.")
     else:
+        if linked.iloc[0]["state"] == State.MANUAL:
+            show_needs_you(linked.iloc[0])
         show_job(linked.iloc[0])
 
-matches_tab, applications_tab, outreach_tab, all_tab, runs_tab = st.tabs(
-    ["Matches", "Applications", "Outreach", "All jobs", "Runs"])
+matches_tab, needs_tab, applications_tab, outreach_tab, all_tab, runs_tab = st.tabs(
+    ["Matches", "Needs you", "Applications", "Outreach", "All jobs", "Runs"])
 
 with matches_tab:
     if jobs.empty:
@@ -243,6 +286,22 @@ with all_tab:
             view = view[(view["title"] + " " + view["company"]).str.lower().str.contains(needle, regex=False)]
         st.caption(f"{len(view)} of {len(jobs)} jobs")
         job_table(view.sort_values("first_seen_at", ascending=False).reset_index(drop=True), "all")
+
+with needs_tab:
+    waiting = jobs[jobs["state"] == State.MANUAL].sort_values("score", ascending=False) if not jobs.empty else jobs
+    if waiting.empty:
+        st.info("Nothing waiting for you. Jobs the agent can't apply to by itself (Workday, LinkedIn, company sites…) appear here.")
+    else:
+        st.caption(f"{len(waiting)} jobs to apply to by hand, best first. Select one for its link, resume and answers.")
+        table = waiting.assign(where=waiting["ats"].fillna("?"))
+        picked = st.dataframe(
+            table[["score", "title", "company", "where", "seen"]], key="needs", hide_index=True, width="stretch",
+            on_select="rerun", selection_mode="single-row",
+            column_config={"score": st.column_config.NumberColumn("Score", format="%d")},
+        )
+        if picked.selection.rows:
+            show_needs_you(table.iloc[picked.selection.rows[0]])
+            show_job(table.iloc[picked.selection.rows[0]])
 
 with applications_tab:
     if not jobs.empty:

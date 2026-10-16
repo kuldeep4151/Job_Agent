@@ -24,6 +24,7 @@ caps:                          # start low; raise after a week of clean runs
   ats_applies_per_day: 5
   emails_per_day: 5
   usd_per_day: 4.0             # stop calling Claude for the day after this estimated spend
+  usd_per_month: 60.0          # and for the month (IST calendar month)
 
 outreach:
   enabled: false              # emails are drafted for you to review in the dashboard; true = the outbox sends them

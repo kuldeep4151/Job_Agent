@@ -318,3 +318,19 @@ def test_concurrent_outbox_runs_never_double_send(outbox_world, profile, monkeyp
         with db.session() as session:
             outbox.tick(session, config, ANSWERS, profile, log=logs.append)
     assert sent == [] and logs == ["outbox: another outbox run is in progress; skipping"]
+
+
+
+def test_outbox_logs_a_line_every_tick(outbox_world, profile, monkeypatch, tmp_path):
+    config, _ = outbox_world
+    monkeypatch.setattr(outbox, "LOCK_PATH", tmp_path / "outbox.lock")
+    monkeypatch.setattr(outbox, "in_send_window", lambda config, now=None: True)
+    logs: list[str] = []
+    with db.session() as session:
+        outbox.tick(session, config, ANSWERS, profile, log=logs.append)
+    assert logs == ["outbox: nothing to send"]
+
+    monkeypatch.setattr(outbox.health, "online", lambda timeout=6.0: False)
+    with db.session() as session:
+        outbox.tick(session, config, ANSWERS, profile, log=logs.append)
+    assert logs[-1] == "outbox: offline (Mac asleep?), nothing done"

@@ -72,6 +72,8 @@ class Job(SQLModel, table=True):
     apply_qa: str | None = None           # JSON list of {question, answer, source} for audit
 
     company_website: str | None = None    # from the board (Indeed/Glassdoor) when it gives one
+    ats: str | None = None                # where it's applied to: greenhouse, lever, workday, linkedin, …
+    apply_target: str | None = None       # the URL to apply at (short links resolved)
     outreach_note: str | None = None      # set once contact-finding ran for this job (found / why not)
 
 
@@ -130,3 +132,13 @@ class Suppression(SQLModel, table=True):
     address: str = Field(primary_key=True)
     reason: str
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class Alert(SQLModel, table=True):
+    """Problems worth an immediate email (at most one per kind per day)."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    kind: str = Field(index=True)
+    message: str
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    emailed: bool = False

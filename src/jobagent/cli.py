@@ -73,8 +73,23 @@ def cmd_run(args: argparse.Namespace) -> int:
     from jobagent import pipeline
     from jobagent.discover.normalize import IST
 
+    settings.rotate_logs()
     print(f"=== jobagent run · {datetime.now(IST):%d %b %Y %H:%M} IST ===")
-    record = pipeline.run(smoke=args.smoke)
+    try:
+        record = pipeline.run(smoke=args.smoke)
+    except Exception as e:  # last line of defence: record it, alert, exit non-zero
+        import traceback
+
+        from jobagent import alerts, db
+        from jobagent.models import Run
+
+        traceback.print_exc()
+        with db.session() as session:
+            crash = Run(errors=[f"crashed: {type(e).__name__}: {e}"[:400]])
+            session.add(crash)
+            session.commit()
+            alerts.from_run(session, crash)
+        return 1
     if record is None:
         return 0
     counts = ", ".join(f"{site} {n}" for site, n in sorted(record.source_counts.items())) or "none"
@@ -184,9 +199,31 @@ def cmd_outbox(_args: argparse.Namespace) -> int:
     from jobagent import db
     from jobagent.outreach import outbox
 
+    from datetime import datetime
+
+    from jobagent.discover.normalize import IST
+
+    settings.rotate_logs()
     config, answers, profile = _outreach_context()
     with db.session() as session:
-        outbox.tick(session, config, answers, profile)
+        outbox.tick(session, config, answers, profile, log=lambda line: print(f"{datetime.now(IST):%d %b %H:%M} {line}"))
+    return 0
+
+
+def cmd_digest(args: argparse.Namespace) -> int:
+    from jobagent import db, digest
+    from jobagent.config import load_config
+
+    settings.rotate_logs()
+    config = load_config()
+    with db.session() as session:
+        if args.print:
+            subject, body = digest.build(session, config)
+            print(f"Subject: {subject}\n\n{body}")
+            return 0
+        print(digest.send(session, config))
+        if removed := digest.prune_screenshots(session):
+            print(f"housekeeping: removed {removed} old screenshot(s)")
     return 0
 
 
@@ -279,7 +316,7 @@ def main() -> int:
     naukri_cmd.add_argument("action", choices=["login", "status", "inspect"])
     naukri_cmd.add_argument("target", nargs="?", default="", help="for inspect: a job id or a Naukri job URL")
     naukri_cmd.set_defaults(func=cmd_naukri)
-    apply_cmd = sub.add_parser("apply", help="run only the Naukri apply step (dry run unless live is enabled)")
+    apply_cmd = sub.add_parser("apply", help="run only the apply steps: Naukri, Greenhouse, Lever (dry run unless live)")
     apply_cmd.add_argument("--job", type=int, help="just this job id")
     apply_cmd.add_argument("--live", action="store_true", help="with --job: submit for real even if dry_run is on")
     apply_cmd.set_defaults(func=cmd_apply)
@@ -287,6 +324,9 @@ def main() -> int:
     outreach_cmd = sub.add_parser("outreach", help="find a contact and draft an email for one job")
     outreach_cmd.add_argument("--job", type=int, required=True, help="job id, as shown in the dashboard")
     outreach_cmd.set_defaults(func=cmd_outreach)
+    digest_cmd = sub.add_parser("digest", help="email yourself today's summary (scheduled at 20:45)")
+    digest_cmd.add_argument("--print", action="store_true", help="show it here instead of emailing it")
+    digest_cmd.set_defaults(func=cmd_digest)
     gmail_cmd = sub.add_parser("gmail", help="check the Gmail App Password, or send yourself a test email")
     gmail_cmd.add_argument("action", choices=["check", "test"])
     gmail_cmd.set_defaults(func=cmd_gmail)

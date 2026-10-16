@@ -1,0 +1,39 @@
+<!doctype html><html><head><style>
+  /* like Lever: real radio inputs sit under a styled label */
+  label.choice input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  label.choice span { display: inline-block; padding: 4px 8px; border: 1px solid #999; }
+</style></head><body>
+<!-- Mirrors a live Lever form (jobs.lever.co/<co>/<id>/apply, 2026-10-15). -->
+<form id="application-form" onsubmit="event.preventDefault(); window.submitted = true; document.body.innerHTML = '<h3>Application submitted!</h3>';">
+<ul>
+  <li class="application-question"><div class="application-label">Resume/CV ✱</div><input type="file" name="resume"></li>
+  <li class="application-question"><div class="application-label">Full name ✱</div><input type="text" name="name"></li>
+  <li class="application-question"><div class="application-label">Email ✱</div><input type="email" name="email"></li>
+  <li class="application-question"><div class="application-label">Current location ✱</div>
+    <input type="text" name="location"><input type="hidden" name="selectedLocation"><div id="loc"></div></li>
+  <li class="application-question"><div class="application-label">Current company ✱</div><input type="text" name="org"></li>
+  <li class="application-question"><div class="application-label">Are you comfortable working from our Pune office? ✱</div>
+    <label class="choice"><input type="radio" name="cards[a][field0]" value="Yes"><span>Yes</span></label>
+    <label class="choice"><input type="radio" name="cards[a][field0]" value="No"><span>No</span></label></li>
+  <li class="application-question"><div class="application-label">What is your current salary in LPA? ✱</div>
+    <select name="cards[a][field1]"><option>Select...</option><option>9</option><option>10</option><option>11</option></select></li>
+  <li class="application-question"><div class="application-label">Anything else? (optional)</div><textarea name="comments"></textarea></li>
+</ul>
+<button id="btn-submit" type="submit">SUBMIT APPLICATION</button>
+</form>
+<script>
+  window.submitted = false;
+  const places = ["Indore, WV, USA", "Indore, Madhya Pradesh, IND", "Pune, Maharashtra, IND"];
+  const box = document.querySelector("input[name=location]");
+  box.addEventListener("keyup", () => {  // suggestions appear only as you type, like Lever
+    const typed = box.value.toLowerCase();
+    loc.innerHTML = places.filter(p => p.toLowerCase().startsWith(typed))
+      .map(p => `<div class="dropdown-location">${p}</div>`).join("");
+  });
+  loc.addEventListener("click", e => {
+    const item = e.target.closest(".dropdown-location");
+    box.value = item.innerText; document.querySelector("input[name=selectedLocation]").value = JSON.stringify({name: item.innerText});
+    loc.innerHTML = "";
+  });
+</script>
+</body></html>

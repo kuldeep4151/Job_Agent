@@ -7,7 +7,7 @@ import pytest
 from playwright.sync_api import sync_playwright
 
 from conftest import SAMPLE_PROFILE
-from jobagent.apply import naukri
+from jobagent.apply import evidence, naukri
 from jobagent.apply.answers import AnswerMapper, Question, Unanswerable, flatten, format_value
 from jobagent.models import Job
 from jobagent.profile import load_profile
@@ -117,7 +117,7 @@ def test_free_text_is_checked_for_fabrication(fake_api, mapper):
 
 @pytest.fixture
 def page(monkeypatch, tmp_path):
-    monkeypatch.setattr(naukri, "SHOTS_DIR", tmp_path / "shots")
+    monkeypatch.setattr(evidence, "SHOTS_DIR", tmp_path / "shots")
     monkeypatch.setattr(naukri, "SETTLE_MS", (0, 0))
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
@@ -231,3 +231,12 @@ def test_rejected_answer_goes_to_manual(fake_api, page, mapper, monkeypatch):
 )
 def test_non_apply_pages_never_click(page, mapper, name, status):
     assert naukri.apply_to_job(page, make_job(fixture_url(name)), mapper, live=True).status == status
+
+
+def test_units_in_free_text_boxes(fake_api, mapper):
+    fake_api.reply(mapping("compensation.current_ctc_lpa"))
+    q = Question("Current Compensation", "text", [])
+    assert mapper.answer(q, make_job(), units_in_text=True).value == "10 LPA"
+    assert mapper.answer(q, make_job()).value == "10"  # Naukri's chat boxes validate numbers: no unit
+    fake_api.reply(mapping("notice.notice_period_days", unit="months"))
+    assert mapper.answer(Question("Notice period (months)", "text", []), make_job(), units_in_text=True).value == "1 month"
