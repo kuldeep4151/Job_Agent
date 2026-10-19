@@ -9,6 +9,7 @@ import imaplib
 import re
 import smtplib
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func
@@ -23,6 +24,14 @@ from jobagent.profile import Profile
 
 DRAFT_MAX_AGE = timedelta(days=7)  # an unsent draft older than this is no longer a timely note
 WATCH_REPLIES_FOR = timedelta(days=45)
+REPLY_TEXT_CHARS = 3000  # kept for the Tracker to read
+
+
+@dataclass
+class TickResult:
+    events: list[str] = field(default_factory=list)  # "reply from x.com", "bounced: a@x.com"
+    follow_ups: int = 0
+    sent: Email | None = None
 
 
 def _aware(value: datetime) -> datetime:
@@ -103,6 +112,7 @@ def check_inbox(session: Session, mailbox: gmail.Mailbox) -> list[str]:
             subject, text = mailbox.read(replies[-1])
             sent.replied_at = utcnow()
             sent.reply_snippet = (subject + " | " + " ".join(text.split())[:200]).strip(" |")
+            sent.reply_text = f"Subject: {subject}\n\n{text.strip()}"[:REPLY_TEXT_CHARS]
             first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
             if re.fullmatch(r"(no|no\.|no thanks|not interested)\W*", first_line, re.IGNORECASE):
                 session.merge(Suppression(address=address, reason="asked not to be contacted"))
@@ -183,34 +193,40 @@ LOCK_PATH = settings.LOG_DIR / "outbox.lock"
 
 
 def tick(session: Session, config: Config, answers: dict, profile: Profile,
-         log: Callable[[str], None] = print) -> None:
+         log: Callable[[str], None] = print) -> TickResult:
     """One outbox pass. Holds a file lock so a manual `jobagent outbox` and the scheduled one can never
     both pick the same draft and send it twice."""
     if config.mode.paused:
         log("outbox: paused")
-        return
+        return TickResult()
     with LOCK_PATH.open("w") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             log("outbox: another outbox run is in progress; skipping")
-            return
-        _tick(session, config, answers, profile, log)
+            return TickResult()
+        return _tick(session, config, answers, profile, log)
 
 
-def _tick(session: Session, config: Config, answers: dict, profile: Profile, log: Callable[[str], None]) -> None:
+def _tick(session: Session, config: Config, answers: dict, profile: Profile,
+          log: Callable[[str], None]) -> TickResult:
+    result = TickResult()
     if not health.online():
         log("outbox: offline (Mac asleep?), nothing done")
-        return
+        return result
     if gmail.credentials() is not None and session.exec(select(Email).where(Email.status == EmailStatus.SENT)).first():
         try:
             with gmail.Mailbox() as mailbox:
-                for event in check_inbox(session, mailbox):
-                    log(f"outbox: {event}")
+                result.events = check_inbox(session, mailbox)
+            for event in result.events:
+                log(f"outbox: {event}")
         except (imaplib.IMAP4.error, OSError) as e:
             log(f"outbox: couldn't read the inbox ({e}); will retry next tick")
-    if queued := queue_follow_ups(session, config, answers, profile):
-        log(f"outbox: queued {queued} follow-up(s)")
-    if send_next(session, config, profile, log=log) is None and sending_blocked(session, config) is None:
+    result.follow_ups = queue_follow_ups(session, config, answers, profile)
+    if result.follow_ups:
+        log(f"outbox: queued {result.follow_ups} follow-up(s)")
+    result.sent = send_next(session, config, profile, log=log)
+    if result.sent is None and sending_blocked(session, config) is None:
         log("outbox: nothing to send")  # a line per tick, so outbox.log shows it's alive
+    return result
 

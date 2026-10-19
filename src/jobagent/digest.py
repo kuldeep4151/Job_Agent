@@ -1,7 +1,8 @@
-"""The daily summary email to yourself (`jobagent digest`, 20:45): replies first, then what happened
-today, what needs you, spend, and health. Also does the daily housekeeping (old screenshots)."""
+"""The daily summary email to yourself (sent by the main agent after 20:45, or `jobagent digest`): replies
+first, then what each sub-agent did today, what needs you, spend, and health."""
 
 import time
+from collections import Counter
 from datetime import datetime, timezone
 
 from sqlalchemy import func
@@ -10,16 +11,12 @@ from sqlmodel import Session, select
 from jobagent import guards, health, settings
 from jobagent.config import Config
 from jobagent.discover.normalize import IST
-from jobagent.models import Email, EmailStatus, Job, State
+from jobagent.models import AgentRun, Application, Email, EmailStatus, Job, State, aware
 from jobagent.outreach import gmail
 
 DASHBOARD = "http://localhost:8501"
 NEEDS_YOU_SHOWN = 5
 SCREENSHOT_DAYS = 60
-
-
-def _aware(value: datetime) -> datetime:
-    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 _NAMES = {"naukri": "Naukri", "linkedin": "LinkedIn", "indeed": "Indeed", "glassdoor": "Glassdoor",
@@ -40,8 +37,14 @@ def build(session: Session, config: Config, now: datetime | None = None) -> tupl
     now = (now or datetime.now(IST)).astimezone(IST)
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
 
-    runs = health.runs_since(session, midnight)
-    done = [r for r in runs if health.OFFLINE_NOTE not in r.notes]
+    turns = session.exec(select(AgentRun).where(AgentRun.started_at >= midnight).order_by(AgentRun.started_at)).all()
+    ticks = [t for t in turns if t.agent == "main"]
+    offline = sum(t.outcome == "offline" for t in ticks)
+    did: dict[str, Counter] = {}
+    for turn in turns:
+        did.setdefault(turn.agent, Counter()).update(turn.counts)
+    finder, tracker = did.get("finder", Counter()), did.get("tracker", Counter())
+    statuses = Counter(session.exec(select(Application.status)).all())
     applied = session.exec(select(Job).where(Job.applied_at >= midnight).order_by(Job.applied_at)).all()
     needs_you = session.exec(select(Job).where(Job.state == State.MANUAL).order_by(Job.score.desc())).all()
     sent = session.exec(select(Email).where(Email.status == EmailStatus.SENT, Email.sent_at >= midnight)).all()
@@ -59,16 +62,22 @@ def build(session: Session, config: Config, now: datetime | None = None) -> tupl
         lines.append("")
 
     lines.append("TODAY")
-    skipped = len(runs) - len(done)
-    last = f" · last at {_aware(done[-1].started_at).astimezone(IST):%H:%M}" if done else ""
-    lines.append(f"  Runs: {len(done)} completed" + (f" ({skipped} skipped: Mac asleep)" if skipped else "") + last)
-    lines.append(f"  Jobs: {sum(r.found for r in done)} found, {sum(r.new for r in done)} new, "
-                 f"{sum(r.scored for r in done)} scored, {_n(sum(r.matches for r in done), 'match', 'matches')}")
-    lines.append(f"  Applied ({len(applied)}):" if applied else "  Applied: none today")
+    last = f", last at {aware(ticks[-1].started_at).astimezone(IST):%H:%M}" if ticks else ""
+    lines.append(f"  Main agent: {_n(len(ticks) - offline, 'tick')}{last}"
+                 + (f" ({offline} more found no internet: Mac asleep)" if offline else ""))
+    lines.append(f"  Finder: {_n(finder['searched'], 'search', 'searches')}, {finder['found']} jobs found "
+                 f"({finder['new']} new), {finder['scored']} scored, {_n(finder['matches'], 'match', 'matches')}, "
+                 f"{_n(finder['tailored'], 'resume')} tailored")
+    lines.append(f"  Applier: applied to {len(applied)}" + (":" if applied else " today"))
     lines += [f"    • {j.company} · {j.title} ({_where(j)})" for j in applied]
-    lines.append(f"  Emails: {len(sent)} sent, {drafts} draft(s) waiting"
+    lines.append(f"  Mailer: {len(sent)} sent, {drafts} draft(s) waiting"
                  + (f", {len(bounces)} bounced" if bounces else "")
                  + ("" if config.outreach.enabled else " (sending is off)"))
+    if statuses:
+        changes = tracker["tracked"] + tracker["updated"]
+        lines.append(f"  Tracker: {_n(sum(statuses.values()), 'application')} · "
+                     + ", ".join(f"{n} {status}" for status, n in statuses.most_common())
+                     + (f" ({_n(changes, 'change')} today)" if changes else ""))
     lines.append(f"  Claude: ${guards.spent_today_usd():.2f} today (cap ${config.caps.usd_per_day:.2f}) · "
                  f"${guards.spent_this_month_usd():.2f} this month (cap ${config.caps.usd_per_month:.2f})")
     lines.append("")

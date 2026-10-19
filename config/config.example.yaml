@@ -33,6 +33,23 @@ outreach:
   company_cooldown_days: 30    # never email the same company twice within this window
   find_website: true           # look up company websites (Claude web search) to find HR/careers addresses
 
+agents:                        # the main agent runs these every 15 minutes (`jobagent schedule install`)
+  finder:                      # searches the boards, screens and scores jobs, tailors resumes
+    enabled: true
+    sweep_every_hours: 3       # a new search sweep this long after the last one started
+    minutes_per_tick: 8        # a sweep is done in slices, so a sleeping Mac costs one slice, not the sweep
+  applier:                     # Naukri, Greenhouse and Lever forms (caps above); the rest goes to "Needs you"
+    enabled: true
+    hours: [9, 21]             # IST; Chrome needs the Mac awake
+    minutes_per_tick: 6
+  mailer:                      # finds hiring contacts, drafts and sends emails, reads replies
+    enabled: true
+    minutes_per_tick: 3
+  tracker:                     # your list of applications: data/applications.csv and the dashboard
+    enabled: true
+    no_response_after_days: 21
+    naukri_sync_hours: []      # e.g. [10, 18]: read "viewed by recruiter" from Naukri's applied-jobs page
+
 mode:
   dry_run: true                # do everything except the final submit/send
   paused: false                # kill switch

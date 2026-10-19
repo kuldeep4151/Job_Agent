@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Literal
 
 from playwright.sync_api import Locator, Page
+from selectolax.lexbor import LexborHTMLParser
 
 from jobagent import llm, settings
 from jobagent.apply.answers import Answer, AnswerMapper, Question, Unanswerable, clean_question
@@ -26,6 +27,7 @@ from jobagent.profile import Profile
 from jobagent.tailor import tailor
 
 HOME_URL = "https://www.naukri.com/mnjuser/homepage"
+APPLIES_URL = "https://www.naukri.com/myapply/historypage"  # "Job application status"
 LOGIN_URL = "https://www.naukri.com/nlogin/login"
 MAX_QUESTIONS = 15
 RESULT_TIMEOUT_SECONDS = 90
@@ -119,6 +121,44 @@ def inspect(page: Page, url: str, tag: str) -> dict:
                                 text: e.innerText.trim().slice(0, 50)}))""",
     )
     return {"state": detect_state(page), "buttons": buttons, "screenshot": save_evidence(page, tag, "inspect", html=True)}
+
+
+# ---------- your applications' status (read-only) ----------
+
+
+@dataclass
+class AppliedJob:
+    job_id: str   # Naukri's id: a Job's external_id is "nk-" + this
+    title: str
+    company: str
+    status: str   # the card's chip, e.g. "Application sent 2 days ago"
+
+
+def parse_applies(html: str) -> list[AppliedJob]:
+    """The cards on the "Applies on Naukri" list. Each card's links carry the job id."""
+    found = []
+    for card in LexborHTMLParser(html).css(".applyHistoryListContainer .jdTupleContainer"):
+        title, company, status = (card.css_first(sel) for sel in (".jdTitle", ".company", ".apply-status"))
+        ids = re.findall(r"(?:jobId|flowId)=(\d+)", card.html or "")
+        if title is not None and ids:
+            found.append(AppliedJob(ids[0], title.text(strip=True), company.text(strip=True) if company else "",
+                                    status.text(strip=True) if status else ""))
+    return found
+
+
+def read_applies(page: Page, max_scrolls: int = 15) -> list[AppliedJob]:
+    """Open the application-status page and read every card (the list loads more as it scrolls). Never clicks."""
+    page.goto(APPLIES_URL, wait_until="domcontentloaded", timeout=60_000)
+    page.wait_for_timeout(4000)
+    cards = page.locator(".applyHistoryListContainer .jdTupleContainer")
+    for _ in range(max_scrolls):
+        before = cards.count()
+        if before:
+            cards.last.scroll_into_view_if_needed()
+        page.wait_for_timeout(1500)
+        if cards.count() == before:
+            break
+    return parse_applies(page.content())
 
 
 # ---------- questionnaire ----------

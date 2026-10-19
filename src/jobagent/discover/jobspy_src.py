@@ -31,31 +31,43 @@ def queries(search: Search, smoke: bool = False) -> list[tuple[str, str, bool]]:
     return combos
 
 
-def discover(search: Search, batch: Batch, smoke: bool = False) -> None:
+def units(search: Search, smoke: bool = False) -> list[tuple[str, str, str, bool]]:
+    """Every (site, role, location, remote) search in a sweep, in the order they run."""
+    return [(site, role, location, remote) for role, location, remote in queries(search, smoke) for site in search.sites]
+
+
+def discover(search: Search, batch: Batch, smoke: bool = False, *, start: int = 0,
+             until: float | None = None) -> int | None:
+    """Run the searches from `start` on, stopping before the next one once time.monotonic() passes `until`
+    (at least one always runs). Returns where to resume, or None when the sweep is complete."""
     results_wanted = 5 if smoke else search.results_per_query
-    for role, location, remote in queries(search, smoke):
-        for site in search.sites:
-            label = f"{site} '{role}' in {location}{' (remote)' if remote else ''}"
+    todo = units(search, smoke)
+    for i in range(start, len(todo)):
+        if until is not None and i > start and time.monotonic() >= until:
+            return i
+        site, role, location, remote = todo[i]
+        label = f"{site} '{role}' in {location}{' (remote)' if remote else ''}"
+        try:
+            frame = scrape_jobs(
+                site_name=[site],
+                search_term=role,
+                location=location,
+                is_remote=remote,
+                results_wanted=results_wanted,
+                hours_old=search.hours_old,
+                country_indeed="India",
+                fetch_description=True,
+                verbose=0,
+            )
+        except Exception as e:  # one failing site must not stop the others
+            batch.errors.append(f"{label}: {type(e).__name__}: {e}"[:300])
+            continue
+        for row in frame.to_dict("records"):
             try:
-                frame = scrape_jobs(
-                    site_name=[site],
-                    search_term=role,
-                    location=location,
-                    is_remote=remote,
-                    results_wanted=results_wanted,
-                    hours_old=search.hours_old,
-                    country_indeed="India",
-                    fetch_description=True,
-                    verbose=0,
-                )
-            except Exception as e:  # one failing site must not stop the others
-                batch.errors.append(f"{label}: {type(e).__name__}: {e}"[:300])
-                continue
-            for row in frame.to_dict("records"):
-                try:
-                    batch.jobs.append(from_jobspy(row, query_city=None if remote else location))
-                    batch.counts[site] += 1
-                except Exception as e:
-                    batch.errors.append(f"{label}: bad row {row.get('id')}: {e}"[:300])
-            if site == "linkedin":
-                time.sleep(random.uniform(3, 6))  # LinkedIn returns 429 on bursts from one IP
+                batch.jobs.append(from_jobspy(row, query_city=None if remote else location))
+                batch.counts[site] += 1
+            except Exception as e:
+                batch.errors.append(f"{label}: bad row {row.get('id')}: {e}"[:300])
+        if site == "linkedin":
+            time.sleep(random.uniform(3, 6))  # LinkedIn returns 429 on bursts from one IP
+    return None

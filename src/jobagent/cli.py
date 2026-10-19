@@ -67,43 +67,105 @@ def cmd_render(_args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run(args: argparse.Namespace) -> int:
+def _record_crash(e: Exception) -> None:
+    """Last line of defence: record the crash (dashboard, daily report) and send an alert."""
+    import traceback
+
+    from jobagent import alerts, db
+    from jobagent.models import AgentRun
+
+    traceback.print_exc()
+    with db.session() as session:
+        crash = AgentRun(agent="main", outcome="error", errors=[f"crashed: {type(e).__name__}: {e}"[:400]])
+        session.add(crash)
+        session.commit()
+        alerts.from_run(session, crash)
+
+
+def _stamped(line: str) -> None:
     from datetime import datetime
 
-    from jobagent import pipeline
+    from jobagent.discover.normalize import IST
+
+    print(f"{datetime.now(IST):%H:%M} {line}")
+
+
+def _banner(what: str) -> None:
+    from datetime import datetime
+
     from jobagent.discover.normalize import IST
 
     settings.rotate_logs()
-    print(f"=== jobagent run · {datetime.now(IST):%d %b %Y %H:%M} IST ===")
+    print(f"=== {what} · {datetime.now(IST):%d %b %Y %H:%M} IST ===")
+
+
+def cmd_main(_args: argparse.Namespace) -> int:
+    from jobagent.agents import main
+
+    _banner("main agent tick")
     try:
-        record = pipeline.run(smoke=args.smoke)
-    except Exception as e:  # last line of defence: record it, alert, exit non-zero
-        import traceback
-
-        from jobagent import alerts, db
-        from jobagent.models import Run
-
-        traceback.print_exc()
-        with db.session() as session:
-            crash = Run(errors=[f"crashed: {type(e).__name__}: {e}"[:400]])
-            session.add(crash)
-            session.commit()
-            alerts.from_run(session, crash)
+        with main.watchdog():
+            main.tick(log=_stamped)
+    except Exception as e:
+        _record_crash(e)
         return 1
-    if record is None:
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    from jobagent import health, pipeline
+    from jobagent.agents import main
+
+    _banner("jobagent run (every sub-agent once)")
+    try:
+        tally = pipeline.run(smoke=args.smoke, log=_stamped)
+    except Exception as e:
+        _record_crash(e)
+        return 1
+    if tally is None:
         return 0
-    counts = ", ".join(f"{site} {n}" for site, n in sorted(record.source_counts.items())) or "none"
-    print(
-        f"\nRun #{record.id}: found {record.found} ({counts}); {record.new} new, {record.duplicates} duplicates\n"
-        f"  skipped {record.skipped} · scored {record.scored} · matches {record.matches} · "
-        f"tailored {record.tailored} · applied {record.applied} · emails drafted {record.drafted} · "
-        f"Claude cost ≈ ${record.cost_usd:.2f}"
-    )
-    for note in record.notes:
-        print(f"  note: {note}")
-    for error in record.errors:
-        print(f"  error: {error}")
-    return 1 if record.found == 0 and record.errors else 0
+    sources = ", ".join(f"{site} {n}" for site, n in sorted(tally.source_counts.items())) or "none"
+    print(f"\nAll together: {main.summary(tally)} (jobs by site: {sources})")
+    return 1 if any(e.startswith(health.FATAL) for e in tally.errors) else 0
+
+
+def cmd_agent(args: argparse.Namespace) -> int:
+    from jobagent import health
+    from jobagent.agents import main
+
+    _banner(f"jobagent agent {args.name}")
+    try:
+        tally = main.tick(force=True, only=args.name, log=_stamped)
+    except Exception as e:
+        _record_crash(e)
+        return 1
+    return 1 if tally and any(e.startswith(health.FATAL) for e in tally.errors) else 0
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    from jobagent import db, pipeline, schedule
+    from jobagent.agents import main
+    from jobagent.discover.normalize import IST
+    from jobagent.models import aware
+
+    match = pipeline.context()
+    with db.session() as session:
+        ticks = main.ticks_today(session)
+        rows = main.status(session, match)
+    offline = sum(t.outcome == "offline" for t in ticks)
+    last = f"; last at {aware(ticks[-1].started_at).astimezone(IST):%H:%M}: {ticks[-1].summary}" if ticks else ""
+    print(f"Main agent: {len(ticks) - offline} ticks today" + (f" ({offline} more found no internet)" if offline else "")
+          + last)
+    print(f"Schedule: {schedule.status()}")
+    for row in rows:
+        when = (f"last {aware(row.last.started_at).astimezone(IST):%d %b %H:%M}: {row.last.summary}"
+                if row.last else "hasn't run yet")
+        if row.last and row.last.outcome == "error":
+            when += f"\n{'':12}ERROR: {next(iter(row.last.errors), '')[:200]}"
+        queue = ", ".join(f"{name} {n}" for name, n in row.queue.items()) or "empty"
+        print(f"\n  {row.agent.title:<9} {'on ' if row.enabled else 'off'} {when}")
+        print(f"{'':12}queue: {queue} → {row.waiting or 'runs on the next tick'}")
+    return 0
 
 
 def cmd_tailor(args: argparse.Namespace) -> int:
@@ -306,8 +368,15 @@ def main() -> int:
     init.add_argument("--force", action="store_true", help="overwrite an existing (non-sample) profile")
     init.set_defaults(func=cmd_init)
     sub.add_parser("render", help="re-render the master resume PDF from profile.json").set_defaults(func=cmd_render)
-    run = sub.add_parser("run", help="discover fresh jobs, filter them, and score them with Claude")
-    run.add_argument("--smoke", action="store_true", help="tiny run: first role, first city, 5 jobs per site")
+    sub.add_parser("main", help="one tick of the main agent: each sub-agent with work runs for a while "
+                   "(scheduled every 15 min)").set_defaults(func=cmd_main)
+    agent_cmd = sub.add_parser("agent", help="run one sub-agent now, a whole pass (ignores its hours and cadence)")
+    agent_cmd.add_argument("name", choices=["finder", "applier", "mailer", "tracker"])
+    agent_cmd.set_defaults(func=cmd_agent)
+    sub.add_parser("status", help="what each sub-agent did last, what's waiting for it, and when it runs next"
+                   ).set_defaults(func=cmd_status)
+    run = sub.add_parser("run", help="every sub-agent once, now: a whole search sweep, screening, applying, emails")
+    run.add_argument("--smoke", action="store_true", help="tiny search: first role, first city, 5 jobs per site")
     run.set_defaults(func=cmd_run)
     tailor = sub.add_parser("tailor", help="(re)build the tailored resume for one job")
     tailor.add_argument("job_id", type=int, help="job id, as shown in the dashboard")
@@ -320,17 +389,17 @@ def main() -> int:
     apply_cmd.add_argument("--job", type=int, help="just this job id")
     apply_cmd.add_argument("--live", action="store_true", help="with --job: submit for real even if dry_run is on")
     apply_cmd.set_defaults(func=cmd_apply)
-    sub.add_parser("outbox", help="check replies, queue follow-ups, send one email (run every 15 min)").set_defaults(func=cmd_outbox)
+    sub.add_parser("outbox", help="check replies, queue follow-ups, send one email (the Mailer does this)").set_defaults(func=cmd_outbox)
     outreach_cmd = sub.add_parser("outreach", help="find a contact and draft an email for one job")
     outreach_cmd.add_argument("--job", type=int, required=True, help="job id, as shown in the dashboard")
     outreach_cmd.set_defaults(func=cmd_outreach)
-    digest_cmd = sub.add_parser("digest", help="email yourself today's summary (scheduled at 20:45)")
+    digest_cmd = sub.add_parser("digest", help="email yourself today's summary (the main agent sends it after 20:45)")
     digest_cmd.add_argument("--print", action="store_true", help="show it here instead of emailing it")
     digest_cmd.set_defaults(func=cmd_digest)
     gmail_cmd = sub.add_parser("gmail", help="check the Gmail App Password, or send yourself a test email")
     gmail_cmd.add_argument("action", choices=["check", "test"])
     gmail_cmd.set_defaults(func=cmd_gmail)
-    schedule = sub.add_parser("schedule", help="run `jobagent run` automatically through the day (launchd)")
+    schedule = sub.add_parser("schedule", help="run the main agent every 15 minutes (launchd)")
     schedule.add_argument("action", choices=["install", "uninstall", "status"])
     schedule.set_defaults(func=cmd_schedule)
     sub.add_parser("dashboard", help="open the web dashboard (localhost)").set_defaults(func=cmd_dashboard)

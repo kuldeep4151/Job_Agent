@@ -1,15 +1,18 @@
-"""One run: discover → store (dedupe) → hard filters → skill prefilter → Claude score.
+"""The stages the sub-agents run (see agents/): store (dedupe) → hard filters → skill prefilter → Claude score
+→ tailor → route → apply → outreach.
 
-Each stage only picks up jobs in its input state, so a crashed or interrupted run is
-finished by the next one, and nothing is scored twice.
+Each stage only picks up jobs in its input state, so a crashed or interrupted turn is finished by the
+next one, and nothing is scored twice. Stages that call Claude or open Chrome take `until`
+(a time.monotonic() deadline) and leave the rest for the next turn once it passes.
 """
 
 import random
 import time
 import traceback
+from collections import Counter
 from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import timedelta
 
 import anthropic
@@ -18,12 +21,10 @@ from playwright.sync_api import Error as PlaywrightError
 from sqlalchemy import func
 from sqlmodel import Session, select
 
-from jobagent import alerts, db, guards, health, llm, settings
+from jobagent import db, guards, llm, settings
 from jobagent.apply import browser, evidence, greenhouse, lever, naukri, router
 from jobagent.apply.answers import AnswerMapper
-from jobagent.config import load_answers, load_config, load_targets
-from jobagent.discover import ats_boards, jobspy_src
-from jobagent.discover.jobspy_src import Batch
+from jobagent.config import Config, load_answers, load_config
 from jobagent.discover.normalize import norm_company
 from jobagent.match import (
     MatchContext,
@@ -35,7 +36,7 @@ from jobagent.match import (
     score_job,
     scoring_system_prompt,
 )
-from jobagent.models import Email, EmailStatus, Job, Run, State, utcnow
+from jobagent.models import Email, EmailStatus, Job, State, utcnow
 from jobagent.outreach import compose, contacts, outbox
 from jobagent.profile import Profile, load_profile
 from jobagent.tailor import tailor
@@ -46,19 +47,49 @@ NO_DESCRIPTION = "returned no job description"
 
 @dataclass
 class Tally:
+    """What a turn did. A sub-agent's counts are stored on its AgentRun; `jobagent run` adds them all up."""
+
+    searched: int = 0     # searches done (one site, one role, one place)
+    found: int = 0
+    new: int = 0
+    duplicates: int = 0
     skipped: int = 0
     scored: int = 0
     matches: int = 0
     tailored: int = 0
+    needs_you: int = 0
     applied: int = 0
     drafted: int = 0
-    needs_you: int = 0
+    sent: int = 0
+    replies: int = 0
+    bounced: int = 0
+    follow_ups: int = 0
+    tracked: int = 0      # applications added to the Tracker's list
+    updated: int = 0      # application status changes
+    checked: int = 0      # times Naukri's application-status page was read
+    source_counts: Counter = field(default_factory=Counter)
     notes: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     def note(self, text: str) -> None:
         if text not in self.notes:
             self.notes.append(text)
+
+    def counts(self) -> dict[str, int]:
+        """The non-zero counters, in field order."""
+        return {f.name: value for f in fields(self) if isinstance(value := getattr(self, f.name), int) and value}
+
+    def add(self, other: "Tally") -> None:
+        for name, value in other.counts().items():
+            setattr(self, name, getattr(self, name) + value)
+        self.source_counts.update(other.source_counts)
+        for text in other.notes:
+            self.note(text)
+        self.errors += other.errors
+
+
+def out_of_time(until: float | None) -> bool:
+    return until is not None and time.monotonic() >= until
 
 
 def store(session: Session, jobs: list[Job]) -> tuple[int, int]:
@@ -98,7 +129,7 @@ def filter_discovered(session: Session, ctx: MatchContext, tally: Tally) -> None
     session.commit()
 
 
-def score_filtered(session: Session, ctx: MatchContext, tally: Tally) -> None:
+def score_filtered(session: Session, ctx: MatchContext, tally: Tally, *, until: float | None = None) -> None:
     if ctx.profile is None:
         tally.notes.append("Scoring skipped: config/profile.json is still the sample placeholder.")
         return
@@ -125,6 +156,8 @@ def score_filtered(session: Session, ctx: MatchContext, tally: Tally) -> None:
             tally.skipped += 1
         elif not has_key:
             job.skill_overlap = overlap
+        elif out_of_time(until):
+            break
         elif guards.budget_left_usd(ctx.config) <= 0:
             tally.note(f"Daily Claude budget (${ctx.config.caps.usd_per_day}) reached; rest waits.")
             break
@@ -145,7 +178,7 @@ def score_filtered(session: Session, ctx: MatchContext, tally: Tally) -> None:
         session.commit()
 
 
-def tailor_scored(session: Session, ctx: MatchContext, tally: Tally) -> None:
+def tailor_scored(session: Session, ctx: MatchContext, tally: Tally, *, until: float | None = None) -> None:
     """Per-job resume for every match that won't go through Naukri's own (profile-based) apply."""
     if ctx.profile is None or not llm.api_key_configured():
         return  # score_filtered already noted why
@@ -154,6 +187,8 @@ def tailor_scored(session: Session, ctx: MatchContext, tally: Tally) -> None:
     for job in pending:  # best matches first, so a budget stop hits the weakest
         if tailor.uses_naukri_profile(job):
             continue
+        if out_of_time(until):
+            break
         if guards.budget_left_usd(ctx.config) <= 0:
             tally.note(f"Daily Claude budget (${ctx.config.caps.usd_per_day}) reached; rest waits.")
             break
@@ -219,9 +254,30 @@ def _record_outcome(job: Job, outcome: evidence.Outcome) -> None:
         job.state = State.FAILED
 
 
-def apply_naukri(
-    session: Session, ctx: MatchContext, tally: Tally, *, job_id: int | None = None, log: Callable[[str], None] = print
-) -> None:
+def _not_attempted(query, live: bool):
+    return query.where(Job.applied_at.is_(None) if live else Job.dry_run_at.is_(None))
+
+
+def naukri_ready(live: bool):
+    """Naukri matches applied to with Naukri's own button (company-site ones are tailored and routed)."""
+    return _not_attempted(select(Job).where(Job.state == State.SCORED, Job.source == "naukri",
+                                            Job.apply_url.is_(None)), live)
+
+
+def ats_ready(live: bool):
+    return _not_attempted(select(Job).where(Job.state == State.TAILORED, Job.ats.in_(list(router.AUTO_ATS))), live)
+
+
+def _budget_spent(config: Config, tally: Tally) -> bool:
+    """Form answers come from Claude, so applying stops with the day's budget too."""
+    if guards.budget_left_usd(config) > 0:
+        return False
+    tally.note(f"Daily Claude budget (${config.caps.usd_per_day}) reached; rest waits.")
+    return True
+
+
+def apply_naukri(session: Session, ctx: MatchContext, tally: Tally, *, job_id: int | None = None,
+                 until: float | None = None, log: Callable[[str], None] = print) -> None:
     """Apply (or dry-run) to the best Naukri matches, within today's cap, in the logged-in Chrome profile."""
     mode, why = guards.apply_mode(ctx.config)
     if mode == "off" or ctx.profile is None:
@@ -230,14 +286,13 @@ def apply_naukri(
     if job_id is not None:
         query = select(Job).where(Job.id == job_id, Job.source == "naukri")
     else:
-        query = select(Job).where(Job.state == State.SCORED, Job.source == "naukri", Job.apply_url.is_(None))
-        query = query.where(Job.applied_at.is_(None) if live else Job.dry_run_at.is_(None))
+        query = naukri_ready(live)
     remaining = ctx.config.caps.naukri_applies_per_day - guards.naukri_attempts_today(session, live)
     if remaining <= 0:
         tally.note(f"Naukri daily cap ({ctx.config.caps.naukri_applies_per_day}) reached.")
         return
     jobs = session.exec(query.order_by(Job.score.desc()).limit(remaining)).all()
-    if not jobs:
+    if not jobs or _budget_spent(ctx.config, tally):
         return
     if not live:
         tally.note(f"Naukri: {why}; nothing was submitted.")
@@ -252,6 +307,8 @@ def apply_naukri(
             return
         failures_in_a_row = 0
         for i, job in enumerate(jobs):
+            if i and (out_of_time(until) or _budget_spent(ctx.config, tally)):
+                break
             if i:
                 time.sleep(random.uniform(*PAUSE_SECONDS))
             log(f"Naukri {'apply' if live else 'dry run'}: {job.title} at {job.company}")
@@ -280,8 +337,16 @@ OUTREACH_STATES = (State.SCORED, State.TAILORED, State.APPLIED, State.MANUAL)
 OUTREACH_MAX_AGE = timedelta(days=7)
 
 
+def outreach_candidates(config: Config):
+    """Recent matches whose hiring contact hasn't been looked for yet."""
+    return select(Job).where(
+        Job.state.in_(OUTREACH_STATES), Job.score >= config.matching.min_score,
+        Job.outreach_note.is_(None), Job.first_seen_at >= utcnow() - OUTREACH_MAX_AGE,
+    )
+
+
 def draft_outreach(session: Session, ctx: MatchContext, tally: Tally, *, job_id: int | None = None,
-                   log: Callable[[str], None] = print) -> list[Email]:
+                   until: float | None = None, log: Callable[[str], None] = print) -> list[Email]:
     """Find a hiring contact for recent matches and draft one email each (the outbox sends them later)."""
     config = ctx.config
     if config.mode.paused or ctx.profile is None or not llm.api_key_configured():
@@ -293,15 +358,12 @@ def draft_outreach(session: Session, ctx: MatchContext, tally: Tally, *, job_id:
         room = config.caps.emails_per_day - pending  # never pile up more drafts than a day's sending
         if room <= 0:
             return []
-        jobs = session.exec(select(Job).where(
-            Job.state.in_(OUTREACH_STATES), Job.score >= config.matching.min_score,
-            Job.outreach_note.is_(None), Job.first_seen_at >= utcnow() - OUTREACH_MAX_AGE,
-        ).order_by(Job.score.desc())).all()
+        jobs = session.exec(outreach_candidates(config).order_by(Job.score.desc())).all()
 
     system = compose.system_prompt(ctx.profile)
     drafted: list[Email] = []
     for job in jobs:
-        if len(drafted) >= room:
+        if len(drafted) >= room or out_of_time(until):
             break
         if guards.budget_left_usd(config) <= 0:
             tally.note(f"Daily Claude budget (${config.caps.usd_per_day}) reached; rest waits.")
@@ -341,7 +403,7 @@ def draft_outreach(session: Session, ctx: MatchContext, tally: Tally, *, job_id:
 
 
 def apply_ats(session: Session, ctx: MatchContext, tally: Tally, *, job_id: int | None = None,
-              log: Callable[[str], None] = print) -> None:
+              until: float | None = None, log: Callable[[str], None] = print) -> None:
     """Greenhouse/Lever forms for tailored matches, within caps.ats_applies_per_day (dry run unless live)."""
     mode, why = guards.apply_mode(ctx.config)
     if mode == "off" or ctx.profile is None:
@@ -350,11 +412,10 @@ def apply_ats(session: Session, ctx: MatchContext, tally: Tally, *, job_id: int 
     if job_id is not None:
         query = select(Job).where(Job.id == job_id, Job.ats.in_(list(router.AUTO_ATS)))
     else:
-        query = select(Job).where(Job.state == State.TAILORED, Job.ats.in_(list(router.AUTO_ATS)))
-        query = query.where(Job.applied_at.is_(None) if live else Job.dry_run_at.is_(None))
+        query = ats_ready(live)
     remaining = ctx.config.caps.ats_applies_per_day - guards.ats_attempts_today(session, live)
     jobs = session.exec(query.order_by(Job.score.desc()).limit(max(remaining, 0))).all()
-    if remaining <= 0 or not jobs:
+    if remaining <= 0 or not jobs or out_of_time(until) or _budget_spent(ctx.config, tally):
         return
     if not live:
         tally.note(f"Greenhouse/Lever: {why}; nothing was submitted.")
@@ -366,6 +427,8 @@ def apply_ats(session: Session, ctx: MatchContext, tally: Tally, *, job_id: int 
             return
         page = browser.first_page(context)
         for i, job in enumerate(jobs):
+            if i and (out_of_time(until) or _budget_spent(ctx.config, tally)):
+                break
             if i:
                 time.sleep(random.uniform(*PAUSE_SECONDS))
             resume = tailor.resume_for_job(job, ctx.profile)
@@ -392,6 +455,11 @@ def _real_profile() -> Profile | None:
     return None if profile.is_placeholder() else profile
 
 
+def context() -> MatchContext:
+    """What every stage needs: config, your profile (None while it's the sample) and answers."""
+    return MatchContext(config=load_config(), profile=_real_profile(), answers=load_answers())
+
+
 def apply_only(*, job_id: int | None = None, live: bool = False, log: Callable[[str], None] = print) -> Tally:
     """Just the apply stages, Naukri then Greenhouse/Lever (no discovery/scoring): `jobagent apply`.
 
@@ -400,11 +468,10 @@ def apply_only(*, job_id: int | None = None, live: bool = False, log: Callable[[
     """
     if live and job_id is None:
         raise ValueError("live override is for a single job only")
-    config = load_config()
+    ctx = context()
     if live:
-        config = config.model_copy(deep=True)
-        config.mode.dry_run = False
-    ctx = MatchContext(config=config, profile=_real_profile(), answers=load_answers())
+        ctx.config = ctx.config.model_copy(deep=True)
+        ctx.config.mode.dry_run = False
     tally = Tally()
     with db.session() as session:
         apply_naukri(session, ctx, tally, job_id=job_id, log=log)
@@ -412,7 +479,7 @@ def apply_only(*, job_id: int | None = None, live: bool = False, log: Callable[[
     return tally
 
 
-def _step(name: str, session: Session, tally: Tally, action: Callable[[], object], log: Callable[[str], None]) -> None:
+def step(name: str, session: Session, tally: Tally, action: Callable[[], object], log: Callable[[str], None]) -> None:
     """Run one stage; an error is recorded and the next stages still run (seen live: a lost connection
     in one stage used to crash the whole run, leaving no record of it)."""
     try:
@@ -423,64 +490,9 @@ def _step(name: str, session: Session, tally: Tally, action: Callable[[], object
         log(f"step {name} failed:\n{traceback.format_exc()}")
 
 
-def run(*, smoke: bool = False, log: Callable[[str], None] = print) -> Run | None:
-    config = load_config()
-    if config.mode.paused:
-        log("Paused (mode.paused in config.yaml): nothing done.")
-        return None
+def run(*, smoke: bool = False, log: Callable[[str], None] = print) -> Tally | None:
+    """`jobagent run`: every sub-agent once, now, ignoring cadence and hours (a whole search sweep, not a
+    slice). None when paused or another tick is running."""
+    from jobagent.agents import main  # the sub-agents are built on this module's stages
 
-    started, spent_before = utcnow(), guards.spent_today_usd()
-    if not health.online():
-        log(health.OFFLINE_NOTE)
-        with db.session() as session:
-            record = Run(started_at=started, finished_at=utcnow(), notes=[health.OFFLINE_NOTE])
-            session.add(record)
-            session.commit()
-        return record
-
-    batch = Batch()
-    searches = len(jobspy_src.queries(config.search, smoke))
-    log(f"Searching {', '.join(config.search.sites)}: {searches} searches each…")
-    jobspy_src.discover(config.search, batch, smoke)
-    if not smoke:
-        ats_boards.discover(load_targets(), config.search, batch)
-
-    tally = Tally(errors=list(batch.errors))
-    tally.notes += [f"No jobs from {site} this run." for site in config.search.sites if not batch.counts[site]]
-    ctx = MatchContext(config=config, profile=_real_profile(), answers=load_answers())
-
-    with db.session() as session:
-        new, duplicates = store(session, batch.jobs)
-        log(f"Found {len(batch.jobs)} ({new} new, {duplicates} duplicates). Filtering and scoring…")
-        steps = [
-            ("filter", lambda: filter_discovered(session, ctx, tally)),
-            ("score", lambda: score_filtered(session, ctx, tally)),
-            ("tailor", lambda: tailor_scored(session, ctx, tally)),
-            ("route", lambda: route_tailored(session, tally)),
-            ("naukri", lambda: apply_naukri(session, ctx, tally, log=log)),
-            ("greenhouse/lever", lambda: apply_ats(session, ctx, tally, log=log)),
-            ("outreach", lambda: draft_outreach(session, ctx, tally, log=log)),
-        ]
-        for name, action in steps:
-            _step(name, session, tally, action, log)
-        record = Run(
-            started_at=started,
-            finished_at=utcnow(),
-            found=len(batch.jobs),
-            new=new,
-            duplicates=duplicates,
-            skipped=tally.skipped,
-            scored=tally.scored,
-            matches=tally.matches,
-            tailored=tally.tailored,
-            applied=tally.applied,
-            drafted=tally.drafted,
-            cost_usd=round(guards.spent_today_usd() - spent_before, 4),
-            source_counts=dict(batch.counts),
-            errors=tally.errors,
-            notes=tally.notes,
-        )
-        session.add(record)
-        session.commit()
-        alerts.from_run(session, record)
-    return record
+    return main.tick(force=True, smoke=smoke, log=log)

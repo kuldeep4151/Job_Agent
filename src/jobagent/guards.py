@@ -66,6 +66,19 @@ def budget_left_usd(config: Config) -> float:
     return min(config.caps.usd_per_day - spent_today_usd(), config.caps.usd_per_month - spent_this_month_usd())
 
 
+def claude_available(config: Config) -> bool:
+    return llm.api_key_configured() and budget_left_usd(config) > 0
+
+
+def spent_since(moment: datetime, log_path: Path | None = None) -> float:
+    """Claude spend since an exact moment (one sub-agent's turn), from the usage log."""
+    path = log_path or llm.USAGE_LOG
+    if not path.exists():
+        return 0.0
+    records = (json.loads(line) for line in path.read_text().splitlines())
+    return sum(r["cost_usd"] for r in records if datetime.fromisoformat(r["ts"]) >= moment)
+
+
 def ats_attempts_today(session: Session, live: bool) -> int:
     """Greenhouse/Lever applications (or dry runs) today: their own cap, separate from Naukri's."""
     column = Job.applied_at if live else Job.dry_run_at

@@ -45,6 +45,36 @@ class Mode(BaseModel):
     paused: bool = False
 
 
+class FinderAgent(BaseModel):
+    enabled: bool = True
+    sweep_every_hours: float = 3  # start a new search sweep this long after the last one started
+    minutes_per_tick: float = 8   # searching takes at most 60% of it, screening the rest
+
+
+class ApplierAgent(BaseModel):
+    enabled: bool = True
+    hours: tuple[int, int] = (9, 21)  # IST: Chrome needs the Mac awake with a screen
+    minutes_per_tick: float = 6
+
+
+class MailerAgent(BaseModel):
+    enabled: bool = True  # finding contacts and drafting; sending also needs outreach.enabled
+    minutes_per_tick: float = 3
+
+
+class TrackerAgent(BaseModel):
+    enabled: bool = True
+    no_response_after_days: int = 21
+    naukri_sync_hours: list[int] = []  # IST hours to read Naukri's "Applied jobs" statuses, e.g. [10, 18]
+
+
+class Agents(BaseModel):
+    finder: FinderAgent = FinderAgent()
+    applier: ApplierAgent = ApplierAgent()
+    mailer: MailerAgent = MailerAgent()
+    tracker: TrackerAgent = TrackerAgent()
+
+
 class Config(BaseModel):
     reviewed: bool = False
     search: Search
@@ -52,6 +82,7 @@ class Config(BaseModel):
     matching: Matching = Matching()
     caps: Caps = Caps()
     outreach: Outreach = Outreach()
+    agents: Agents = Agents()
     mode: Mode = Mode()
 
 

@@ -11,6 +11,11 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def aware(value: datetime) -> datetime:
+    """SQLite gives datetimes back without a time zone; they are all UTC."""
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
 class State(StrEnum):
     DISCOVERED = "discovered"  # stored, not yet filtered
     FILTERED = "filtered"      # passed hard filters, waiting for skill prefilter + Claude score
@@ -78,7 +83,12 @@ class Job(SQLModel, table=True):
 
 
 class Run(SQLModel, table=True):
+    """One search sweep by the Finder (before the sub-agents: one whole `jobagent run`).
+
+    A sweep is done in slices across ticks: next_unit is where the next slice starts, None once finished."""
+
     id: int | None = Field(default=None, primary_key=True)
+    next_unit: int | None = None
     started_at: datetime = Field(default_factory=utcnow)
     finished_at: datetime | None = None
     found: int = 0
@@ -123,6 +133,8 @@ class Email(SQLModel, table=True):
     in_reply_to: str | None = None        # follow-ups thread under the first email
     replied_at: datetime | None = None
     reply_snippet: str | None = None
+    reply_text: str | None = None         # the start of the reply, for the Tracker to classify
+    reply_kind: str | None = None         # set once the Tracker has read the reply (see tracker.ReplyKind)
     bounced_at: datetime | None = None
 
 
@@ -131,6 +143,48 @@ class Suppression(SQLModel, table=True):
 
     address: str = Field(primary_key=True)
     reason: str
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class AgentRun(SQLModel, table=True):
+    """One turn of a sub-agent within a tick. agent="main" is the tick itself; "digest" the daily report."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    agent: str = Field(index=True)        # main, finder, applier, mailer, tracker, digest
+    started_at: datetime = Field(default_factory=utcnow, index=True)
+    finished_at: datetime | None = None
+    outcome: str = "ok"                   # ok | error | offline
+    summary: str = ""
+    counts: dict[str, int] = Field(default_factory=dict, sa_column=Column(JSON))
+    cost_usd: float = 0.0
+    errors: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    notes: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+
+
+class AppStatus(StrEnum):
+    APPLIED = "applied"
+    VIEWED = "viewed"            # the recruiter opened it (Naukri)
+    REPLIED = "replied"          # an email reply that isn't an invite or a no
+    INTERVIEW = "interview"
+    OFFER = "offer"              # only you set this
+    REJECTED = "rejected"
+    NO_RESPONSE = "no response"  # no news for agents.tracker.no_response_after_days
+
+
+class Application(SQLModel, table=True):
+    """A job you applied to, or emailed your resume about: the Tracker keeps its status current."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    job_id: int = Field(index=True, unique=True)
+    company: str
+    title: str
+    via: str                              # Naukri, Greenhouse, Lever, you (by hand), email (outreach only)
+    applied_at: datetime | None = None    # None: already applied before the agent got there
+    emailed_to: str | None = None
+    status: str = Field(default=AppStatus.APPLIED, index=True)
+    status_at: datetime = Field(default_factory=utcnow)
+    status_note: str | None = None
+    history: list[dict] = Field(default_factory=list, sa_column=Column(JSON))  # {at, status, by, note}
     created_at: datetime = Field(default_factory=utcnow)
 
 

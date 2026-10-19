@@ -7,11 +7,13 @@ import pandas as pd
 import streamlit as st
 from sqlmodel import select
 
-from jobagent import db, guards, settings, setup_status
+from jobagent import db, guards, pipeline, settings, setup_status
+from jobagent.agents import main as main_agent
+from jobagent.agents import tracker
 from jobagent.apply.answers import copy_ready_answers
 from jobagent.config import load_answers, load_config
 from jobagent.discover.normalize import IST
-from jobagent.models import Email, EmailStatus, Job, Run, State, utcnow
+from jobagent.models import AgentRun, Application, AppStatus, Email, EmailStatus, Job, Run, State, utcnow
 from jobagent.profile import load_profile
 
 st.set_page_config(page_title="Job Agent", page_icon="💼", layout="wide")
@@ -69,9 +71,22 @@ def show_email(email: pd.Series, key: str) -> None:
         st.rerun()
 
 
-def load_runs() -> pd.DataFrame:
+@st.cache_data(ttl=30)
+def load_applications() -> pd.DataFrame:
     with db.session() as session:
-        rows = [run.model_dump() for run in session.exec(select(Run).order_by(Run.id.desc()).limit(50)).all()]
+        rows = [app.model_dump() for app in session.exec(select(Application)).all()]
+    return pd.DataFrame(rows)
+
+
+def load_sweeps() -> pd.DataFrame:
+    with db.session() as session:
+        rows = [run.model_dump() for run in session.exec(select(Run).order_by(Run.id.desc()).limit(30)).all()]
+    return pd.DataFrame(rows)
+
+
+def load_turns() -> pd.DataFrame:
+    with db.session() as session:
+        rows = [t.model_dump() for t in session.exec(select(AgentRun).order_by(AgentRun.id.desc()).limit(100)).all()]
     return pd.DataFrame(rows)
 
 
@@ -86,13 +101,10 @@ with st.sidebar:
     st.metric("Claude spend today", f"${spent:.2f}", help=f"Daily cap ${cap:.2f} (config.yaml → caps.usd_per_day)")
     st.progress(min(spent / cap, 1.0) if cap else 0.0)
 
-    runs = load_runs()
-    if not runs.empty:
-        last = runs.iloc[0]
-        st.caption(
-            f"Last run {_ist(last['started_at'])}: {last['found']} found, {last['new']} new, "
-            f"{last['matches']} matches"
-        )
+    turns = load_turns()
+    ticks = turns[turns["agent"] == "main"] if not turns.empty else turns
+    if not ticks.empty:
+        st.caption(f"Main agent, last tick {_ist(ticks.iloc[0]['started_at'])}: {ticks.iloc[0]['summary']}")
 
     st.subheader("Setup")
     for item in setup_status.setup_items():
@@ -134,6 +146,9 @@ def show_job(job: pd.Series) -> None:
     st.markdown(f"**Your skills in this posting:** {', '.join(job['skill_overlap']) or '–'}")
     if job["apply_note"]:
         show_application(job)
+    tracked = applications[applications["job_id"] == job["id"]] if not applications.empty else applications
+    if not tracked.empty:
+        show_tracking(tracked.iloc[0])
     if job["outreach_note"]:
         st.markdown("#### Outreach")
         st.caption(f"Contact: {job['outreach_note']}")
@@ -163,7 +178,35 @@ def set_outcome(job_id: int, applied: bool) -> None:
         else:
             job.state, job.skip_reason = State.SKIPPED, "not interested (dismissed in the dashboard)"
         session.commit()
+        if applied:  # on the Tracker's list right away, not at its next turn
+            tracker.sync_applications(session)
+            tracker.export_csv(session)
     st.cache_data.clear()
+
+
+def save_status(app_id: int, status: str, note: str) -> None:
+    with db.session() as session:
+        tracker.record_your_edit(session, session.get(Application, app_id), status, note)
+    st.cache_data.clear()
+
+
+def show_tracking(app: pd.Series) -> None:
+    """Where this application stands, its history, and a way to set the status yourself."""
+    app = app.astype(object).where(app.notna(), None)
+    st.markdown("#### Tracker")
+    st.markdown(f"**{app['status']}** since {_ist(app['status_at'])}" + (f": {app['status_note']}" if app["status_note"] else ""))
+    history = pd.DataFrame(app["history"])
+    if not history.empty:
+        history["at"] = pd.to_datetime(history["at"]).map(_ist)
+        st.dataframe(history[["at", "status", "by", "note"]], hide_index=True)
+    statuses = [s.value for s in AppStatus]
+    left, mid, right = st.columns([2, 4, 1])
+    status = left.selectbox("Status", statuses, index=statuses.index(app["status"]), key=f"status-{app['id']}")
+    note = mid.text_input("Note (optional)", key=f"status-note-{app['id']}")
+    right.write("")
+    if right.button("Save", key=f"status-save-{app['id']}"):
+        save_status(int(app["id"]), status, note)
+        st.rerun()
 
 
 def show_needs_you(job: pd.Series) -> None:
@@ -247,6 +290,7 @@ def job_table(frame: pd.DataFrame, key: str) -> None:
 # ---------- main ----------
 jobs = load_jobs()
 emails = load_emails()
+applications = load_applications()
 
 # Deep link (e.g. from the daily digest): ?job=<id> shows that job above the tabs.
 linked_id = st.query_params.get("job")
@@ -259,8 +303,8 @@ if linked_id and not jobs.empty:
             show_needs_you(linked.iloc[0])
         show_job(linked.iloc[0])
 
-matches_tab, needs_tab, applications_tab, outreach_tab, all_tab, runs_tab = st.tabs(
-    ["Matches", "Needs you", "Applications", "Outreach", "All jobs", "Runs"])
+matches_tab, needs_tab, applications_tab, outreach_tab, agents_tab, all_tab = st.tabs(
+    ["Matches", "Needs you", "Applications", "Outreach", "Agents", "All jobs"])
 
 with matches_tab:
     if jobs.empty:
@@ -304,15 +348,34 @@ with needs_tab:
             show_job(table.iloc[picked.selection.rows[0]])
 
 with applications_tab:
-    if not jobs.empty:
-        acted = jobs[jobs["state"].isin([State.APPLIED, State.MANUAL, State.FAILED]) | jobs["dry_run_at"].notna()]
-        st.caption(
-            f"Applied {int((acted['state'] == State.APPLIED).sum())} · needs you {int((acted['state'] == State.MANUAL).sum())}"
-            f" · failed {int((acted['state'] == State.FAILED).sum())} · dry runs {int(acted['dry_run_at'].notna().sum())}"
-        )
-        job_table(acted.sort_values("first_seen_at", ascending=False).reset_index(drop=True), "applications")
+    if applications.empty:
+        st.info("No applications yet. The Tracker lists every job the agent applies to, every one you mark "
+                "applied, and every company the Mailer emails.")
     else:
-        st.info("No applications yet.")
+        counts = applications["status"].value_counts()
+        st.caption(" · ".join(f"{status} {n}" for status, n in counts.items())
+                   + f" · also in {settings.stored_path(tracker.CSV_PATH)}")
+        picked_statuses = st.multiselect("Status", list(counts.index), placeholder="all")
+        view = applications[applications["status"].isin(picked_statuses)] if picked_statuses else applications
+        view = view.assign(applied=view["applied_at"].map(_ist).replace("", "earlier"), since=view["status_at"].map(_ist))
+        view = view.sort_values("applied_at", ascending=False, na_position="last").reset_index(drop=True)
+        picked = st.dataframe(
+            view[["company", "title", "via", "applied", "status", "since", "status_note", "emailed_to"]],
+            key="applications", hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
+            column_config={"status_note": "note", "emailed_to": "emailed"},
+        )
+        if tracker.CSV_PATH.exists():
+            st.download_button("Download as CSV", tracker.CSV_PATH.read_bytes(), file_name="applications.csv",
+                               mime="text/csv")
+        if picked.selection.rows:
+            job_row = jobs[jobs["id"] == view.iloc[picked.selection.rows[0]]["job_id"]]
+            if not job_row.empty:
+                show_job(job_row.iloc[0])
+    if not jobs.empty:
+        tried = jobs[(jobs["state"] == State.FAILED) | (jobs["dry_run_at"].notna() & (jobs["state"] != State.APPLIED))]
+        if not tried.empty:
+            with st.expander(f"Dry runs and failed attempts ({len(tried)})"):
+                job_table(tried.sort_values("first_seen_at", ascending=False).reset_index(drop=True), "attempts")
 
 with outreach_tab:
     if emails.empty:
@@ -332,21 +395,42 @@ with outreach_tab:
         if event.selection.rows:
             show_email(emails.iloc[event.selection.rows[0]], key="tab")
 
-with runs_tab:
-    if runs.empty:
-        st.info("No runs yet.")
-    else:
-        table = runs.assign(
-            started=runs["started_at"].map(_ist),
-            sources=runs["source_counts"].map(lambda c: ", ".join(f"{k} {v}" for k, v in sorted(c.items()))),
-        )
+with agents_tab:
+    with db.session() as session:
+        agent_rows = main_agent.status(session, pipeline.context())
+        today = main_agent.ticks_today(session)
+    offline = sum(t.outcome == "offline" for t in today)
+    st.caption(f"The main agent ticks every 15 minutes: {len(today) - offline} ticks today"
+               + (f" ({offline} more found no internet: Mac asleep)" if offline else "")
+               + ". Each sub-agent with work gets a turn of a few minutes.")
+    st.dataframe(
+        pd.DataFrame([{
+            "agent": row.agent.title,
+            "on": "on" if row.enabled else "off",
+            "last turn": _ist(row.last.started_at) if row.last else "never",
+            "result": row.last.summary if row.last else "",
+            "waiting": ", ".join(f"{name} {n}" for name, n in row.queue.items()) or "nothing",
+            "next tick": row.waiting or "runs",
+        } for row in agent_rows]),
+        hide_index=True, width="stretch",
+    )
+    for row in agent_rows:
+        if row.last and row.last.outcome == "error":
+            st.error(f"{row.agent.title}, {_ist(row.last.started_at)}: {row.last.errors[0] if row.last.errors else ''}")
+    recent = turns[turns["agent"] != "main"] if not turns.empty else turns
+    if not recent.empty:
+        st.markdown("#### Recent turns")
         st.dataframe(
-            table[["id", "started", "found", "new", "duplicates", "skipped", "scored", "matches", "cost_usd", "sources"]],
-            hide_index=True,
-            width="stretch",
+            recent.assign(at=recent["started_at"].map(_ist))[["at", "agent", "outcome", "summary", "cost_usd"]],
+            hide_index=True, width="stretch", column_config={"cost_usd": st.column_config.NumberColumn("Claude $", format="%.2f")},
         )
-        latest = runs.iloc[0]
-        for note in latest["notes"]:
-            st.caption(f"Note (run {latest['id']}): {note}")
-        for error in latest["errors"]:
-            st.error(f"Run {latest['id']}: {error}")
+    sweeps = load_sweeps()
+    if not sweeps.empty:
+        with st.expander("Search sweeps"):
+            table = sweeps.assign(
+                started=sweeps["started_at"].map(_ist),
+                progress=sweeps.apply(lambda r: "searching" if pd.notna(r["next_unit"]) else _ist(r["finished_at"]), axis=1),
+                sources=sweeps["source_counts"].map(lambda c: ", ".join(f"{k} {v}" for k, v in sorted(c.items()))),
+            )
+            st.dataframe(table[["id", "started", "progress", "found", "new", "duplicates", "sources"]],
+                         hide_index=True, width="stretch")

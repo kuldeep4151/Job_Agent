@@ -9,8 +9,9 @@ import httpx2
 import pytest
 
 from jobagent import health, llm, settings, setup_status
+from jobagent.agents import main, tracker
 from jobagent.apply import browser, evidence, naukri, router
-from jobagent.outreach import contacts, gmail
+from jobagent.outreach import contacts, gmail, outbox
 
 SAMPLE_PROFILE = settings.CONFIG_DIR / "profile.example.json"
 
@@ -62,8 +63,8 @@ class FakeAPI:
 
 @pytest.fixture(autouse=True)
 def isolate_from_real_setup(monkeypatch, tmp_path):
-    """Every test: no real Chrome profile, email, inbox, DNS or data/ writes, and never "live" because the
-    user's setup is.
+    """Every test: no real Chrome profile, email, inbox, DNS, locks or data/ writes, and never "live" because
+    the user's setup is.
 
     Tests that need a browser or live mode opt in explicitly (see naukri_world / go_live).
     """
@@ -84,6 +85,9 @@ def isolate_from_real_setup(monkeypatch, tmp_path):
     monkeypatch.setattr(setup_status, "ready_for_live", lambda: False)
     monkeypatch.setattr(settings, "RESUME_DIR", tmp_path / "resumes")
     monkeypatch.setattr(evidence, "SHOTS_DIR", tmp_path / "shots")
+    monkeypatch.setattr(tracker, "CSV_PATH", tmp_path / "applications.csv")
+    monkeypatch.setattr(main, "LOCK_PATH", tmp_path / "main.lock")  # a real tick may hold the real lock
+    monkeypatch.setattr(outbox, "LOCK_PATH", tmp_path / "outbox.lock")
 
 
 @pytest.fixture

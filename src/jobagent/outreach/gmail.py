@@ -14,6 +14,7 @@ from pathlib import Path
 
 SMTP_HOST, SMTP_PORT = "smtp.gmail.com", 465
 IMAP_HOST = "imap.gmail.com"
+IMAP_TIMEOUT_SECONDS = 60
 PLACEHOLDER = "REPLACE_ME"
 
 
@@ -54,7 +55,7 @@ def check_login() -> None:
     address, password = credentials() or ("", "")
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
         smtp.login(address, password)
-    imap = imaplib.IMAP4_SSL(IMAP_HOST)
+    imap = imaplib.IMAP4_SSL(IMAP_HOST, timeout=IMAP_TIMEOUT_SECONDS)
     imap.login(address, password)
     imap.logout()
 
@@ -69,7 +70,8 @@ class Mailbox:
 
     def __enter__(self) -> "Mailbox":
         address, password = credentials() or ("", "")
-        self.imap = imaplib.IMAP4_SSL(IMAP_HOST)
+        # a timeout, so a connection that dies (Mac asleep mid-check) fails this tick instead of hanging every later one
+        self.imap = imaplib.IMAP4_SSL(IMAP_HOST, timeout=IMAP_TIMEOUT_SECONDS)
         self.imap.login(address, password)
         self.imap.select("INBOX", readonly=True)
         return self

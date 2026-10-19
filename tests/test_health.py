@@ -11,7 +11,7 @@ from sqlmodel import select
 from jobagent import alerts, db, digest, guards, health, settings
 from jobagent.config import Config, Search
 from jobagent.discover.normalize import IST
-from jobagent.models import Alert, Email, EmailStatus, Job, Run, State, utcnow
+from jobagent.models import AgentRun, Alert, Application, Email, EmailStatus, Job, Run, State, utcnow
 from jobagent.outreach import gmail
 
 NOON = datetime(2026, 10, 16, 13, 0, tzinfo=IST)
@@ -39,36 +39,56 @@ def at(hour: int, minute: int = 0) -> datetime:
     return NOON.replace(hour=hour, minute=minute).astimezone(timezone.utc)
 
 
+def sweep(hour: int, **counts) -> Run:
+    return Run(started_at=at(hour), finished_at=at(hour, 40), source_counts=counts)
+
+
 def test_healthy_day_has_no_problems(world):
     config, _ = world
-    add(Run(started_at=at(8), source_counts={"naukri": 10, "linkedin": 4}),
-        Run(started_at=at(11), source_counts={"naukri": 8, "linkedin": 2}))
+    add(AgentRun(agent="main", started_at=at(8)), AgentRun(agent="main", started_at=at(11)),
+        sweep(8, naukri=10, linkedin=4), sweep(11, naukri=8, linkedin=2))
     with db.session() as session:
         assert health.problems(session, config, NOON) == []
 
 
-def test_problems_are_explained(world):
+def test_problems_are_explained_once_each(world):
     config, _ = world
-    add(Run(started_at=at(8), notes=[health.OFFLINE_NOTE]),
-        Run(started_at=at(9), source_counts={"naukri": 5}, notes=["Naukri is logged out: run `jobagent naukri login`."]),
-        Run(started_at=at(11), source_counts={"naukri": 3}, errors=["step score failed: RuntimeError: boom"]))
+    logged_out = "Naukri is logged out: run `jobagent naukri login`."
+    add(AgentRun(agent="main", started_at=at(8), outcome="offline", notes=[health.OFFLINE_NOTE]),
+        AgentRun(agent="main", started_at=at(9)),
+        AgentRun(agent="applier", started_at=at(9), notes=[logged_out]),
+        AgentRun(agent="applier", started_at=at(9, 15), notes=[logged_out]),
+        AgentRun(agent="finder", started_at=at(11), outcome="error", errors=["step score failed: RuntimeError: boom"]),
+        AgentRun(agent="finder", started_at=at(11, 15), errors=["linkedin 'x' in Pune: HTTPError 429"]),  # not fatal
+        sweep(8, naukri=5), sweep(11, naukri=3))
     with db.session() as session:
         found = health.problems(session, config, NOON)
-    assert "1 run(s) were skipped because the Mac had no internet (asleep)." in found
-    assert any("09:00" in p and "logged out" in p for p in found)
-    assert any("11:00" in p and "step score failed" in p for p in found)
-    assert "No jobs from linkedin in the last 2 runs (blocked, or the site changed)." in found
+    assert found == [
+        f"Applier: {logged_out} (2 times, first at 09:00)",
+        "Finder: step score failed: RuntimeError: boom (at 11:00)",
+        "No jobs from linkedin in the last 2 searches (blocked, or the site changed).",
+    ]
 
 
-def test_no_completed_run_by_noon(world):
+def test_unfinished_sweeps_and_old_offline_runs_are_not_judged(world):
     config, _ = world
+    add(AgentRun(agent="main", started_at=at(9)), sweep(8, naukri=5, linkedin=1), sweep(10, naukri=3),
+        Run(started_at=at(11), next_unit=4, source_counts={"naukri": 2}),  # still searching
+        Run(started_at=at(11, 30), finished_at=at(11, 30), notes=[health.OFFLINE_NOTE]))  # from before the agents
     with db.session() as session:
-        assert any(p.startswith("No run has completed today") for p in health.problems(session, config, NOON))
+        assert health.problems(session, config, NOON) == []
+
+
+def test_no_tick_by_noon(world):
+    config, _ = world
+    add(AgentRun(agent="main", started_at=at(8), outcome="offline", notes=[health.OFFLINE_NOTE]))
+    with db.session() as session:
+        assert any(p.startswith("No tick has run today") for p in health.problems(session, config, NOON))
 
 
 def test_alerts_are_emailed_once_per_kind_per_day(world):
     _, sent = world
-    run = Run(notes=["Naukri is logged out: run `jobagent naukri login`. Nothing was applied."])
+    run = AgentRun(agent="applier", notes=["Naukri is logged out: run `jobagent naukri login`. Nothing was applied."])
     with db.session() as session:
         assert alerts.from_run(session, run) == ["naukri_logged_out"]
         alerts.from_run(session, run)
@@ -94,13 +114,23 @@ def test_digest_puts_replies_first_and_lists_what_needs_you(world):
             score=78, state=State.MANUAL, ats="linkedin"),
         Email(job_id=1, company_key="acme", to_address="hr@acme.in", contact_source="job post", subject="s",
               body="b", status=EmailStatus.SENT, sent_at=at(10), replied_at=at(12), reply_snippet="Re: s | Let's talk"),
-        Run(started_at=at(8), found=40, new=12, scored=5, matches=1, source_counts={"naukri": 30, "linkedin": 10}))
+        AgentRun(agent="main", started_at=at(8)), AgentRun(agent="main", started_at=at(8, 15), outcome="offline"),
+        AgentRun(agent="main", started_at=at(8, 30)),
+        AgentRun(agent="finder", started_at=at(8), counts={"searched": 6, "found": 30, "new": 10, "scored": 4}),
+        AgentRun(agent="finder", started_at=at(8, 30), counts={"searched": 6, "found": 10, "new": 2, "scored": 1,
+                                                                "matches": 1, "tailored": 1}),
+        AgentRun(agent="tracker", started_at=at(9), counts={"tracked": 1}),
+        Application(job_id=1, company="Acme", title="AI Trainee", via="Naukri", applied_at=at(9)),
+        sweep(8, naukri=30, linkedin=10), sweep(8, naukri=10, linkedin=1))
     with db.session() as session:
         subject, body = digest.build(session, config, NOON)
     assert subject == "Job agent · 1 reply! 1 applied, 1 need you"
     assert body.index("REPLIES (1)") < body.index("TODAY") < body.index("NEEDS YOU")
     assert "Acme (hr@acme.in): Re: s | Let's talk" in body
-    assert "• Acme · AI Trainee (Naukri)" in body and "Jobs: 40 found, 12 new, 5 scored, 1 match" in body
+    assert "Main agent: 2 ticks, last at 08:30 (1 more found no internet: Mac asleep)" in body
+    assert "Finder: 12 searches, 40 jobs found (12 new), 5 scored, 1 match, 1 resume tailored" in body
+    assert "Applier: applied to 1:\n    • Acme · AI Trainee (Naukri)" in body
+    assert "Tracker: 1 application · 1 applied (1 change today)" in body
     assert "• 78 Orbit · ML Engineer · LinkedIn" in body and f"{digest.DASHBOARD}/?job=2" in body
     assert "✓ All good." in body
 

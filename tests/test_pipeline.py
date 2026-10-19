@@ -7,10 +7,10 @@ import pytest
 from sqlmodel import select
 
 from conftest import SAMPLE_PROFILE
-from jobagent import db, pipeline, schedule
+from jobagent import alerts, db, health, pipeline, schedule
 from jobagent.config import Config, Search
 from jobagent.discover import ats_boards, jobspy_src
-from jobagent.models import Job, Run, State
+from jobagent.models import AgentRun, Job, Run, State
 from jobagent.profile import load_profile
 
 GOOD_JD = "Backend role. Must have 3-5 years experience with Python, Django, PostgreSQL and Kafka."
@@ -37,7 +37,7 @@ def world(monkeypatch, tmp_path, fake_api):
     monkeypatch.setattr(pipeline, "draft_outreach", lambda *a, **k: [])  # outreach stage: see test_outreach
     config = Config(reviewed=True, search=Search(roles=["Backend Developer"], cities=["Bengaluru"]))
 
-    def fake_discover(search, batch, smoke=False):
+    def fake_discover(search, batch, smoke=False, **_):
         for r in ROWS:
             batch.jobs.append(jobspy_src.from_jobspy(r, query_city="Bengaluru"))
             batch.counts[r["site"]] += 1
@@ -97,7 +97,7 @@ def test_missing_description_is_skipped_honestly_then_recovered(world, monkeypat
         [row("21", "indeed", "ML Engineer", "Orbit", GOOD_JD)],  # same opening, with text
     ]
 
-    def fake_discover(search, batch, smoke=False):
+    def fake_discover(search, batch, smoke=False, **_):
         for r in batches.pop(0):
             batch.jobs.append(jobspy_src.from_jobspy(r, query_city="Bengaluru"))
 
@@ -137,11 +137,10 @@ def test_paused_does_nothing(world):
 def test_schedule_plist_and_review_guard(world):
     config, _ = world
     agents = schedule.agents()
-    run, outbox = agents[schedule.RUN_LABEL], agents[schedule.OUTBOX_LABEL]
-    assert run["ProgramArguments"][-1] == "run" and outbox["ProgramArguments"][-1] == "outbox"
-    assert [entry["Hour"] for entry in run["StartCalendarInterval"]] == schedule.RUN_HOURS
-    assert outbox["StartInterval"] == 900
-    assert all("Documents" not in str(a["WorkingDirectory"]) for a in agents.values())  # macOS blocks launchd there
+    assert list(agents) == [schedule.MAIN_LABEL]  # one main agent replaces the run/outbox/digest jobs
+    main = agents[schedule.MAIN_LABEL]
+    assert main["ProgramArguments"][-1] == "main" and main["StartInterval"] == 900
+    assert "Documents" not in str(main["WorkingDirectory"])  # macOS blocks launchd there
     config.reviewed = False
     with pytest.raises(RuntimeError, match="reviewed: false"):
         schedule.install()
@@ -164,7 +163,7 @@ def tailoring_world(world, monkeypatch, tmp_path):
         row("11", "linkedin", "Backend Engineer", "Nimbus", GOOD_JD),
     ]
 
-    def fake_discover(search, batch, smoke=False):
+    def fake_discover(search, batch, smoke=False, **_):
         for r in rows:
             batch.jobs.append(jobspy_src.from_jobspy(r, query_city="Bengaluru"))
             batch.counts[r["site"]] += 1
@@ -235,7 +234,7 @@ def naukri_world(world, monkeypatch, tmp_path):
             r["job_url"] = (NAUKRI_FIXTURES / f"{name}.html").as_uri()
             rows.append(r)
 
-        def fake_discover(search, batch, smoke=False):
+        def fake_discover(search, batch, smoke=False, **_):
             batch.jobs.extend(jobspy_src.from_jobspy(r, query_city="Bengaluru") for r in rows)
 
         monkeypatch.setattr(jobspy_src, "discover", fake_discover)
@@ -345,7 +344,7 @@ def outreach_world(world, monkeypatch):
         row("40", "naukri", "Backend Developer", "Acme Pvt Ltd", GOOD_JD + " Share your CV at careers@acme.in"),
         row("41", "linkedin", "Backend Engineer", "Nimbus", GOOD_JD),  # no address, no website
     ]
-    monkeypatch.setattr(jobspy_src, "discover", lambda search, batch, smoke=False: batch.jobs.extend(
+    monkeypatch.setattr(jobspy_src, "discover", lambda search, batch, smoke=False, **_: batch.jobs.extend(
         jobspy_src.from_jobspy(r, query_city="Bengaluru") for r in rows))
     api.reply_when("You screen", api.body["content"][0]["text"])
     api.reply_when("Write the email", ACME_EMAIL)
@@ -415,7 +414,7 @@ def ats_world(world, monkeypatch):
             row("51", "indeed", "Backend Developer", "Orbit", GOOD_JD)]
     rows[0]["job_url_direct"] = "https://job-boards.greenhouse.io/acme/jobs/1"
     rows[1]["job_url_direct"] = "https://jobs.lever.co/orbit/2"
-    monkeypatch.setattr(jobspy_src, "discover", lambda search, batch, smoke=False: batch.jobs.extend(
+    monkeypatch.setattr(jobspy_src, "discover", lambda search, batch, smoke=False, **_: batch.jobs.extend(
         jobspy_src.from_jobspy(r, query_city="Bengaluru") for r in rows))
     api.reply_when("You screen", api.body["content"][0]["text"])
     api.reply_when("You tailor", TAILOR_PLAN)
@@ -451,17 +450,19 @@ def test_ats_daily_cap(ats_world):
 
 def test_offline_run_is_recorded_and_skipped(world, monkeypatch):
     calls = []
-    monkeypatch.setattr(pipeline.health, "online", lambda timeout=6.0: False)
+    monkeypatch.setattr(health, "online", lambda timeout=6.0: False)
     monkeypatch.setattr(jobspy_src, "discover", lambda *a, **k: calls.append("discover"))
     record = pipeline.run(log=lambda _: None)
-    assert record.notes == [pipeline.health.OFFLINE_NOTE] and calls == []
+    assert record.notes == [health.OFFLINE_NOTE] and calls == []
+    with db.session() as session:
+        assert session.exec(select(AgentRun)).one().outcome == "offline"
 
 
 def test_a_failing_step_is_recorded_and_the_rest_still_run(world, monkeypatch):
     monkeypatch.setenv("GMAIL_ADDRESS", "me@gmail.com")
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "abcdefghijklmnop")
     sent, later = [], []
-    monkeypatch.setattr(pipeline.alerts.gmail, "send", sent.append)
+    monkeypatch.setattr(alerts.gmail, "send", sent.append)
 
     def boom(*_args, **_kwargs):
         raise ConnectionError("network dropped mid-run")
@@ -472,7 +473,7 @@ def test_a_failing_step_is_recorded_and_the_rest_still_run(world, monkeypatch):
 
     assert record.errors == ["step score failed: ConnectionError: network dropped mid-run"]
     assert later == ["outreach"] and record.found == 5  # discovery and later steps still happened
-    assert len(sent) == 1 and "A run hit an error" in sent[0].get_content()
+    assert len(sent) == 1 and "The Finder hit an error: step score failed" in sent[0].get_content()
 
 
 def test_chrome_that_cannot_start_skips_applying(naukri_world, monkeypatch):
@@ -500,13 +501,8 @@ def test_cli_records_a_crash(world, monkeypatch):
     monkeypatch.setattr(pipeline, "run", crash)
     assert cli.cmd_run(type("Args", (), {"smoke": False})()) == 1
     with db.session() as session:
-        assert session.exec(select(Run)).one().errors == ["crashed: RuntimeError: database is locked"]
-
-
-def test_digest_is_scheduled(world):
-    digest = schedule.agents()[schedule.DIGEST_LABEL]
-    assert digest["ProgramArguments"][-1] == "digest"
-    assert digest["StartCalendarInterval"] == {"Hour": 20, "Minute": 45}
+        crashed = session.exec(select(AgentRun)).one()
+    assert (crashed.agent, crashed.outcome, crashed.errors) == ("main", "error", ["crashed: RuntimeError: database is locked"])
 
 
 def open_dashboard(job_id: int | None = None):

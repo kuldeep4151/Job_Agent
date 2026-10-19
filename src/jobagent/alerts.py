@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from sqlmodel import Session, select
 
 from jobagent.discover.normalize import IST
-from jobagent.models import Alert, Run
+from jobagent.models import AgentRun, Alert
 from jobagent.outreach import gmail
 
 # note fragment → (alert kind, what to do)
@@ -26,7 +26,7 @@ def notify(session: Session, kind: str, message: str) -> bool:
     if creds is not None:
         try:
             gmail.send(gmail.build_message(sender=creds[0], sender_name="Job Agent", to=creds[0],
-                                           subject=f"Job agent alert: {message[:80]}", body=message))
+                                           subject=f"Job agent alert: {message.splitlines()[0][:80]}", body=message))
             alert.emailed = True
         except Exception:  # an alert must never break the run that raised it
             pass
@@ -35,14 +35,15 @@ def notify(session: Session, kind: str, message: str) -> bool:
     return alert.emailed
 
 
-def from_run(session: Session, run: Run) -> list[str]:
-    """Alerts a finished run calls for; returns the kinds raised."""
+def from_run(session: Session, run: AgentRun) -> list[str]:
+    """Alerts a sub-agent's finished turn calls for; returns the kinds raised."""
     raised = []
     for fragment, kind, advice in _FROM_NOTES:
         if any(fragment in note for note in run.notes):
             notify(session, kind, f"{fragment}. {advice}")
             raised.append(kind)
     if crashes := [e for e in run.errors if e.startswith(("crashed", "step "))]:
-        notify(session, "run_errors", f"A run hit an error: {crashes[0][:300]}\n\nSee data/logs/run.log.")
+        who = "The main agent" if run.agent == "main" else f"The {run.agent.title()}"
+        notify(session, "run_errors", f"{who} hit an error: {crashes[0][:300]}\n\nSee data/logs/main.log.")
         raised.append("run_errors")
     return raised
